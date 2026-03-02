@@ -28,24 +28,6 @@ def point_sample(input, point_coords, **kwargs):
     return output
 
 
-def generate_boundary_gt(masks, kernel_size=3):
-    """
-    生成【内边界】GT，严格防止建筑物粘连。
-    原理: Edge = Mask - Erode(Mask)
-    只向内收缩，绝不向外膨胀。
-    """
-    # 确保是二值的 Float Tensor
-    masks = (masks > 0.5).float()
-    # 构造 Kernel (3x3)
-    padding = kernel_size // 2
-    # 只做腐蚀 (Erosion)
-    # PyTorch trick: -MaxPool(-x) 等价于 MinPool (Erosion)
-    eroded = -F.max_pool2d(-masks, kernel_size, stride=1, padding=padding)
-    # 内边界 = 原图 - 腐蚀图
-    # 这样生成的边缘完全在建筑物 Mask 内部，两栋楼原本分开，边缘更会分开
-    boundary = masks - eroded
-    return boundary
-
 def calculate_uncertainty(logits):
     """
     计算二分类 logits 的不确定性。
@@ -109,22 +91,6 @@ def dice_loss(inputs, targets, num_masks):
     return loss.sum() / num_masks
 
 
-def tversky_loss(inputs, targets, num_masks, alpha=0.7, beta=0.3):
-    """
-    Tversky Loss for Criterion
-    """
-    inputs = inputs.sigmoid()
-    inputs = inputs.flatten(1)
-    # targets 已经是 flatten 的或者形状匹配的
-
-    tp = (inputs * targets).sum(-1)
-    fp = (inputs * (1 - targets)).sum(-1)
-    fn = ((1 - inputs) * targets).sum(-1)
-
-    loss = 1 - (tp / (tp + alpha * fp + beta * fn + 1e-6))
-    return loss.sum() / num_masks
-
-
 def sigmoid_ce_loss(inputs, targets, num_masks):
     """
     Args:
@@ -143,6 +109,49 @@ def sigmoid_ce_loss(inputs, targets, num_masks):
     # 修复：使用 num_masks 进行归一化
     return loss.mean(1).sum() / num_masks
 
+
+# 将这个工具函数加到 criterion.py 顶部
+def sigmoid_focal_loss(inputs, targets, num_masks, alpha: float = 0.25, gamma: float = 2):
+    """
+    原版 Mask2Former 必备的分类 Focal Loss
+    """
+    prob = inputs.sigmoid()
+    ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    p_t = prob * targets + (1 - prob) * (1 - targets)
+    loss = ce_loss * ((1 - p_t) ** gamma)
+
+    if alpha >= 0:
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = alpha_t * loss
+
+    return loss.sum() / num_masks
+
+    # 替换 criterion.py 中的 loss_labels 函数：
+    def loss_labels(self, outputs, targets, indices, num_masks):
+        """
+        [原汁原味 Mask2Former 修复]
+        放弃传统的 CrossEntropy，改用 Sigmoid Focal Loss 以解决严重漏提。
+        """
+        assert "pred_logits" in outputs
+        src_logits = outputs["pred_logits"].float()  # [B, num_queries, num_classes+1]
+
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)]).to(self.device)
+
+        # 构造 Focal Loss 需要的 One-Hot 标签
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_classes_o
+
+        # 只取前景类的 Logits (索引为 0 的通道)，剔除背景通道
+        src_logits_fg = src_logits[..., 0]  # [B, num_queries]
+
+        # 生成 0/1 掩码，只有被匹配到的 Query 其 GT 才为 1
+        target_classes_onehot = torch.zeros_like(src_logits_fg)
+        target_classes_onehot[idx] = 1.0
+
+        loss_ce = sigmoid_focal_loss(src_logits_fg, target_classes_onehot, num_masks, alpha=0.25, gamma=2.0)
+
+        return {"loss_ce": loss_ce}
 
 class SetCriterion(nn.Module):
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
@@ -163,16 +172,57 @@ class SetCriterion(nn.Module):
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
 
+    # def loss_labels(self, outputs, targets, indices, num_masks):
+    #     assert "pred_logits" in outputs
+    #     src_logits = outputs["pred_logits"].float()
+    #     idx = self._get_src_permutation_idx(indices)
+    #     target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)]).to(self.device)
+    #     target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
+    #     target_classes[idx] = target_classes_o
+    #     loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes,
+    #                               self.empty_weight, label_smoothing=0.1, reduction='sum')/num_masks
+    #     del src_logits, target_classes, target_classes_o
+    #     return {"loss_ce": loss_ce}
+
+    # def loss_labels(self, outputs, targets, indices, num_masks):
+    #     """
+    #     [原汁原味 Mask2Former 修复]
+    #     放弃传统的 CrossEntropy，改用 Sigmoid Focal Loss 以解决严重漏提。
+    #     """
+    #     assert "pred_logits" in outputs
+    #     src_logits = outputs["pred_logits"].float()  # [B, num_queries, num_classes+1]
+    #
+    #     idx = self._get_src_permutation_idx(indices)
+    #     target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)]).to(self.device)
+    #
+    #     # 构造 Focal Loss 需要的 One-Hot 标签
+    #     target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
+    #     target_classes[idx] = target_classes_o
+    #
+    #     # 只取前景类的 Logits (索引为 0 的通道)，剔除背景通道
+    #     src_logits_fg = src_logits[..., 0]  # [B, num_queries]
+    #
+    #     # 生成 0/1 掩码，只有被匹配到的 Query 其 GT 才为 1
+    #     target_classes_onehot = torch.zeros_like(src_logits_fg)
+    #     target_classes_onehot[idx] = 1.0
+    #
+    #     loss_ce = sigmoid_focal_loss(src_logits_fg, target_classes_onehot, num_masks, alpha=0.25, gamma=2.0)
+    #
+    #     return {"loss_ce": loss_ce}
     def loss_labels(self, outputs, targets, indices, num_masks):
         assert "pred_logits" in outputs
-        src_logits = outputs["pred_logits"].float()
+        src_logits = outputs["pred_logits"].float()  # [B, num_queries, 1]
+
         idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)]).to(self.device)
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
-        target_classes[idx] = target_classes_o
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes,
-                                  self.empty_weight, label_smoothing=0.1, reduction='sum')/num_masks
-        del src_logits, target_classes, target_classes_o
+
+        # 你的 target_classes_o 都是 0（因为 dataset.py 里 append 的是 0）
+        # 我们直接构造 0/1 的二值掩码，被匹配到的 Query 设为 1.0，其余为 0.0
+        target_classes_onehot = torch.zeros_like(src_logits)  # [B, num_queries, 1]
+        target_classes_onehot[idx] = 1.0
+
+        # 直接传入 1 通道的 logits 计算 Sigmoid Focal Loss
+        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_masks, alpha=0.25, gamma=2.0)
+
         return {"loss_ce": loss_ce}
 
     def loss_masks(self, outputs, targets, indices, num_masks):
@@ -194,81 +244,40 @@ class SetCriterion(nn.Module):
         target_masks = target_masks.to(src_masks)[tgt_idx]  # [N_matched, H_gt, W_gt]
         target_masks = target_masks.unsqueeze(1)  # [N_matched, 1, H_gt, W_gt]
 
-        # 3. [PointRend] 采样点坐标生成
-        # 我们不需要把 src_masks 放大，而是把采样点撒下去
+        # 3. [PointRend]
         with torch.no_grad():
+            # 1. 寻找网络当前着重刻画的边界点（位于屋顶）
             point_coords = get_uncertain_point_coords_with_randomness(
-                src_masks,
+                src_masks.detach(),
                 self.num_points,  # 12544
                 self.oversample_ratio,  # 3.0
                 self.importance_sample_ratio  # 0.75
             )
-            # point_coords shape: [N_matched, num_points, 2]
 
-            # 4. [PointRend] 在 GT 上采样得到 Point Labels
             point_labels = point_sample(
                 target_masks,
                 point_coords,
                 align_corners=False,
             ).squeeze(1)
 
-        # 5. [PointRend] 在 Pred 上采样得到 Point Logits
+            label_smoothing = 0.1
+            with torch.no_grad():
+                point_labels_smooth = point_labels * (1 - label_smoothing) + label_smoothing * 0.5
+
         point_logits = point_sample(
             src_masks,
             point_coords,
             align_corners=False,
         ).squeeze(1)
 
-
         # 6. 计算 Point-wise Loss
         losses = {
-            "loss_mask": sigmoid_ce_loss(point_logits, point_labels, num_masks),
-            "loss_dice": dice_loss(point_logits, point_labels, num_masks),
+            "loss_mask": sigmoid_ce_loss(point_logits, point_labels_smooth, num_masks),
+            "loss_dice": dice_loss(point_logits, point_labels_smooth, num_masks),
         }
         del point_logits, target_masks, src_masks
         return losses
 
-    # 【新增】边界损失函数
-    def loss_boundary(self, outputs, targets, indices, num_masks):
-        if "pred_boundaries" not in outputs:
-            return {"loss_boundary": torch.tensor(0.0, device=self.device)}
-
-        pred_b = outputs["pred_boundaries"]  # [B, 1, 128, 128]
-
-        with torch.no_grad():
-            # 1. 准备全图 GT Mask (保持 512x512)
-            gt_masks_list = [t["masks"] for t in targets]
-            gt_images = []
-            for m in gt_masks_list:
-                if m.shape[0] == 0:
-                    gt_images.append(torch.zeros((1, m.shape[1], m.shape[2]), device=m.device))
-                else:
-                    gt_images.append(m.max(dim=0, keepdim=True)[0])
-            gt_batch = torch.stack(gt_images)  # [B, 1, 512, 512]
-
-            # 2. 生成高分辨率下的边缘 GT (High-Res Boundary)
-            # 在 512x512 下做腐蚀，边缘会非常精细
-            gt_boundary = generate_boundary_gt(gt_batch, kernel_size=3)
-
-            # 3. 将预测结果上采样到 512x512
-        # 使用 bilinear 插值，这样网络会学会输出"抗锯齿"的平滑概率图
-        pred_b_upsampled = F.interpolate(
-            pred_b,
-            size=gt_batch.shape[-2:],  # 对齐 GT 的尺寸 (512, 512)
-            mode='bilinear',
-            align_corners=False
-        )
-
-        # 4. 计算 Loss
-        # 注意：由于分辨率变大，边缘像素占比会变得更小（更稀疏），
-        # 建议适当提高 pos_weight，或者保持现状观察效果。
-        pos_weight = torch.tensor([10.0], device=pred_b.device)
-        loss_b = F.binary_cross_entropy_with_logits(
-            pred_b_upsampled,
-            gt_boundary,
-            pos_weight=pos_weight
-        )
-        return {"loss_boundary": loss_b}
 
 
     def loss_height(self, outputs, targets, indices, num_masks):
@@ -280,8 +289,10 @@ class SetCriterion(nn.Module):
         if matched_pred_heights.numel() == 0:
             return {"loss_height_l1": src_heights.sum() * 0.0, "loss_height_l2": src_heights.sum() * 0.0}
         del src_heights
+        matched_pred_heights = torch.log1p(matched_pred_heights.clamp(min=0))
+        target_heights   = torch.log1p(target_heights.clamp(min=0))
         return {"loss_height_l1": F.l1_loss(matched_pred_heights, target_heights, reduction='sum')/num_masks,
-                "loss_height_l2": F.mse_loss(matched_pred_heights, target_heights, reduction='sum')/num_masks}
+                "loss_height_l2": F.smooth_l1_loss(matched_pred_heights, target_heights, beta=1.0, reduction='sum') / num_masks}
 
     def _get_src_permutation_idx(self, indices):
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -297,8 +308,8 @@ class SetCriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             'masks': self.loss_masks,
-            'height': self.loss_height,
-            'boundary': self.loss_boundary,  # 注册新 Loss
+            'height': self.loss_height
+            # 'boundary': self.loss_boundary,  # 注册新 Loss
         }
         return loss_map[loss](outputs, targets, indices, num_masks)
 

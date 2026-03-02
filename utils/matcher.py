@@ -23,15 +23,10 @@ def point_sample(input, point_coords, **kwargs):
         output = output.squeeze(3)
     return output
 
+
 def batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor):
     """
     Compute the DICE loss, similar to generalized IOU for masks
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
     """
     inputs = inputs.sigmoid()
     inputs = inputs.flatten(1)
@@ -42,16 +37,6 @@ def batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor):
 
 
 def batch_sigmoid_ce_loss(inputs: torch.Tensor, targets: torch.Tensor):
-    """
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-    Returns:
-        Loss tensor
-    """
     hw = inputs.shape[1]
 
     pos = F.binary_cross_entropy_with_logits(
@@ -61,28 +46,12 @@ def batch_sigmoid_ce_loss(inputs: torch.Tensor, targets: torch.Tensor):
         inputs, torch.zeros_like(inputs), reduction="none"
     )
 
-    loss = torch.einsum("nc,mc->nm", pos, targets) + torch.einsum("nc,mc->nm", neg, (1 - targets)
-                                                                  )
+    loss = torch.einsum("nc,mc->nm", pos, targets) + torch.einsum("nc,mc->nm", neg, (1 - targets))
 
     return loss / hw
 
 
 def batch_sigmoid_focal_loss(inputs, targets, alpha: float = 0.25, gamma: float = 2):
-    """
-    Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-        alpha: (optional) Weighting factor in range (0,1) to balance
-                positive vs negative examples. Default = -1 (no weighting).
-        gamma: Exponent of the modulating factor (1 - p_t) to
-               balance easy vs hard examples.
-    Returns:
-        Loss tensor
-    """
     hw = inputs.shape[1]
 
     prob = inputs.sigmoid()
@@ -101,45 +70,26 @@ def batch_sigmoid_focal_loss(inputs, targets, alpha: float = 0.25, gamma: float 
     return loss / hw
 
 
-# 修改 utils/matcher.py
+def compute_center_cost(pred_masks, tgt_masks):
+    H, W = pred_masks.shape[-2:]
 
-def batch_sigmoid_tversky_loss(inputs, targets, alpha=0.7, beta=0.3):
-    """
-    Tversky Loss for Matcher (Pairwise Calculation)
-    计算所有 Prediction 和所有 GT 之间的两两 Tversky Cost。
+    ys = torch.linspace(0, 1, H, device=pred_masks.device)
+    xs = torch.linspace(0, 1, W, device=pred_masks.device)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
 
-    Args:
-        inputs: [num_queries, num_points] (Logits)
-        targets: [num_gt, num_points] (0/1)
-    Returns:
-        cost_matrix: [num_queries, num_gt]
-    """
-    inputs = inputs.sigmoid()
-    inputs = inputs.flatten(1)  # [N, P]
-    targets = targets.flatten(1)  # [M, P]
+    pred_prob = pred_masks.sigmoid()
+    pred_sum = pred_prob.flatten(1).sum(1).clamp(min=1e-6)
+    pred_cx = (pred_prob * grid_x).flatten(1).sum(1) / pred_sum
+    pred_cy = (pred_prob * grid_y).flatten(1).sum(1) / pred_sum
 
-    # 1. 计算 Intersection (TP) -> [N, M]
-    # 使用 einsum 进行矩阵乘法，计算每一对 (n, m) 的重叠部分
-    tp = torch.einsum("nc,mc->nm", inputs, targets)
+    tgt_sum = tgt_masks.flatten(1).sum(1).clamp(min=1e-6)
+    tgt_cx = (tgt_masks * grid_x).flatten(1).sum(1) / tgt_sum
+    tgt_cy = (tgt_masks * grid_y).flatten(1).sum(1) / tgt_sum
 
-    # 2. 计算各自的总和
-    p_sum = inputs.sum(dim=1)  # [N] Predicted Area
-    t_sum = targets.sum(dim=1)  # [M] Ground Truth Area
-
-    # 3. 推导 FP 和 FN (利用广播机制)
-    # FP (误检) = 预测总面积 - 重叠面积
-    # [N, 1] - [N, M] -> [N, M]
-    fp = p_sum[:, None] - tp
-
-    # FN (漏检) = GT总面积 - 重叠面积
-    # [1, M] - [N, M] -> [N, M]
-    fn = t_sum[None, :] - tp
-
-    # 4. 计算 Tversky 系数
-    tversky = tp / (tp + alpha * fp + beta * fn + 1e-6)
-
-    # 5. 返回 Cost (1 - Tversky)
-    return 1 - tversky
+    dx = pred_cx.unsqueeze(1) - tgt_cx.unsqueeze(0)
+    dy = pred_cy.unsqueeze(1) - tgt_cy.unsqueeze(0)
+    center_cost = torch.sqrt(dx ** 2 + dy ** 2 + 1e-6)
+    return center_cost
 
 
 class HungarianMatcher(nn.Module):
@@ -149,7 +99,7 @@ class HungarianMatcher(nn.Module):
         self.cost_mask = cost_mask
         self.cost_dice = cost_dice
         assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
-        self.num_points = num_points  # 这里的 points 通常比训练少，BDHNet默认好像是 12544
+        self.num_points = num_points
 
     @torch.no_grad()
     def memory_efficient_forward(self, outputs, targets):
@@ -157,48 +107,44 @@ class HungarianMatcher(nn.Module):
         indices = []
 
         for b in range(bs):
-            # 1. Class Cost
-            out_prob = outputs["pred_logits"][b].softmax(-1)
-            tgt_ids = targets[b]["labels"]
-            cost_class = -out_prob[:, tgt_ids]
+            # 1. Class Cost (彻底重构为 Focal Cost)
+            # 此时的 outputs["pred_logits"] 已经被修复为 [B, num_queries, 1]
+            out_prob = outputs["pred_logits"][b].sigmoid()  # [num_queries, 1]
 
-            # 2. Mask Cost (使用 Point Sampling)
+            alpha = 0.25
+            gamma = 2.0
+
+            # 计算匹配到背景的代价 (负样本代价) 和匹配到目标的代价 (正样本代价)
+            neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-(1 - out_prob + 1e-8).log())
+            pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-(out_prob + 1e-8).log())
+
+            # 代价差值：匹配该目标的收益
+            cost_class = pos_cost_class - neg_cost_class  # [num_queries, 1]
+
+            # 获取当前图片中的 GT 数量
+            num_gt = targets[b]["labels"].shape[0]
+            # 因为只有 1 个前景类别(类别0)，任意 Query 分配给任意 GT 的分类代价都是相同的
+            # 我们将 [num_queries, 1] 的代价向量广播成 [num_queries, num_gt] 矩阵
+            if num_gt > 0:
+                cost_class = cost_class.repeat(1, num_gt)
+            else:
+                cost_class = torch.empty((num_queries, 0), device=out_prob.device)
+
+            # 2. Mask Cost (保持原有的优秀实现)
             out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
             tgt_mask = targets[b]["masks"].to(out_mask)  # [num_gt, H_gt, W_gt]
 
-            # 统一形状：[N, 1, H, W]
             out_mask = out_mask.unsqueeze(1)
             tgt_mask = tgt_mask.unsqueeze(1)
 
-
             point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
-            # [关键修改] 生成随机采样点 (Uniform Random)
-            # Matcher 阶段通常只需要随机采样，不需要不确定性采样，因为此时还不知道谁匹配谁
-            # num_points = self.num_points
-            # step = int(torch.sqrt(torch.tensor(num_points)).item())
-            # # 生成归一化网格坐标 [0, 1]
-            # xv, yv = torch.meshgrid(torch.linspace(0, 1, step), torch.linspace(0, 1, step), indexing='ij')
-            # grid_coords = torch.stack([yv, xv], dim=-1).reshape(1, -1, 2).to(out_mask.device)  # [1, step*step, 2]
-            # # 如果点数不够，补齐；多了截断（通常 num_points 设置为 step平方 即可，例如 12544=112*112）
-            # if grid_coords.shape[1] < num_points:
-            #     padding = torch.rand(1, num_points - grid_coords.shape[1], 2, device=out_mask.device)
-            #     point_coords = torch.cat([grid_coords, padding], dim=1)
-            # else:
-            #     point_coords = grid_coords[:, :num_points, :]
-            # # 添加轻微抖动，避免死板
-            # point_coords = point_coords + (torch.rand_like(point_coords) - 0.5) * (1.0 / step)
-            # point_coords = point_coords.clamp(0, 1)
 
-            # 在预测 Mask 上采样
-            # out_mask: [num_queries, 1, H, W] -> sample -> [num_queries, 1, num_points] -> squeeze -> [num_queries, num_points]
             out_mask_sampled = point_sample(
                 out_mask,
                 point_coords.repeat(out_mask.shape[0], 1, 1),
                 align_corners=False
             ).squeeze(1)
 
-            # 在 GT Mask 上采样
-            # tgt_mask: [num_gt, 1, H, W] -> sample -> [num_gt, num_points]
             tgt_mask_sampled = point_sample(
                 tgt_mask,
                 point_coords.repeat(tgt_mask.shape[0], 1, 1),
@@ -209,18 +155,11 @@ class HungarianMatcher(nn.Module):
                 out_mask_sampled = out_mask_sampled.float()
                 tgt_mask_sampled = tgt_mask_sampled.float()
 
-                # 计算 Cost (基于采样点)
-                # cost_mask = batch_sigmoid_ce_loss(out_mask_sampled, tgt_mask_sampled)
-                # Mask2Former/BDHNet 这里通常用 Focal Loss
-                cost_mask = batch_sigmoid_ce_loss(out_mask_sampled, tgt_mask_sampled)
-                # cost_dice = batch_dice_loss(out_mask_sampled, tgt_mask_sampled)
-                cost_dice = batch_sigmoid_tversky_loss(out_mask_sampled, tgt_mask_sampled, alpha=0.7, beta=0.3)
+                cost_mask = batch_sigmoid_focal_loss(out_mask_sampled, tgt_mask_sampled)
+                cost_dice = batch_dice_loss(out_mask_sampled, tgt_mask_sampled)
 
-            C = (
-                    self.cost_mask * cost_mask
-                    + self.cost_class * cost_class
-                    + self.cost_dice * cost_dice
-            )
+            C = (self.cost_mask * cost_mask + self.cost_class * cost_class + self.cost_dice * cost_dice)
+
             C = C.reshape(num_queries, -1).cpu()
 
             indices.append(linear_sum_assignment(C))
