@@ -10,6 +10,7 @@ from .transformer_decoder.mask2former_transformer_decoder import MultiScaleMaske
 from .base.CBAM import CBAM
 from .dinounet_training import DinoEncoder
 from model.SAM3UNet.SAM3UNet import SAM3Encoder
+from model.base.encoders import get_encoder
 
 class MaskFormerHead(nn.Module):
     def __init__(self, input_shape, cfg):
@@ -47,77 +48,6 @@ class MaskFormerHead(nn.Module):
         return predictions
 
 
-
-class LoG_Filter(nn.Module):
-    def __init__(self, in_channels, kernel_size=7, sigma=1.0):
-        super().__init__()
-        self.sigma = sigma
-        self.kernel_size = kernel_size
-
-        # 1. 生成 LoG 核
-        # grid范围: -3 到 3 (对于 k=7)
-        pad = kernel_size // 2
-        coords = torch.arange(-pad, pad + 1, dtype=torch.float32)
-        x, y = torch.meshgrid(coords, coords, indexing='ij')
-
-        # LoG 公式 (对应论文图中的公式)
-        # LoG(x,y) = -1/(pi*sigma^4) * (1 - (x^2+y^2)/(2*sigma^2)) * exp(...)
-        # 注意：通常我们需要翻转算子符号以获得正响应，或者让网络自己适应。
-        # 这里使用标准 LoG 近似
-        r2 = x ** 2 + y ** 2
-        sigma2 = sigma ** 2
-        gamma = 1 / (math.pi * sigma2 ** 2)
-        kernel = gamma * (2 - r2 / sigma2) * torch.exp(-r2 / (2 * sigma2))
-
-        # 归一化 (让核的总和为0，这是拉普拉斯算子的特性)
-        kernel = kernel - kernel.mean()
-
-        # 2. 构造成卷积权重 [Out, In/Groups, k, k]
-        # 使用 Depthwise Conv，每个通道独立滤波
-        kernel = kernel.view(1, 1, kernel_size, kernel_size)
-        kernel = kernel.repeat(in_channels, 1, 1, 1)
-
-        self.register_buffer('weight', kernel)
-        self.groups = in_channels
-        self.padding = pad
-
-    def forward(self, x):
-        return F.conv2d(x, self.weight, padding=self.padding, groups=self.groups)
-
-
-class LEA_Module(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        # 多尺度 LoG 分支
-        self.log_0_5 = LoG_Filter(channels, kernel_size=3, sigma=0.5)
-        self.log_1_0 = LoG_Filter(channels, kernel_size=5, sigma=1.0)
-        self.log_2_0 = LoG_Filter(channels, kernel_size=7, sigma=2.0)
-
-        # 融合卷积 (Concat 3xChannels -> Channels)
-        self.aggregator = nn.Sequential(
-            nn.Conv2d(channels * 3, channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.SiLU(inplace=True)  # 文中提到用 SiLU
-        )
-        # 残差融合
-        # F_res = F_init + BN(SiLU(F_agg)) -> 文中公式(3)
-        # 但通常 Conv 也在 BN 之前。这里 aggregator 已经包含了 conv+bn+silu
-        # 我们稍微调整以匹配常规 ResBlock 逻辑
-        self.final_bn = nn.BatchNorm2d(channels)  # 可选
-
-    def forward(self, x):
-        # x: [B, C, H, W]
-        # 1. 多尺度滤波
-        f1 = self.log_0_5(x)
-        f2 = self.log_1_0(x)
-        f3 = self.log_2_0(x)
-        # 2. 拼接 & 聚合
-        f_cat = torch.cat([f1, f2, f3], dim=1)  # [B, 3C, H, W]
-        f_agg = self.aggregator(f_cat)
-        # 3. 残差连接 (对应论文公式 3)
-        return x + f_agg
-
-
 class AdaBinsHead(nn.Module):
     def __init__(self,min_height, max_height):
         super().__init__()
@@ -135,64 +65,176 @@ class AdaBinsHead(nn.Module):
         return pred_heights
 
 
-class BoundaryHead(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        # 简单的卷积层，从特征图中提取边缘
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 1, kernel_size=1)
-        )
-    def forward(self, x):
-        return self.conv(x)
-
 ## Reference:
 ## SAM3UNET; DINOV3UNET
+# ── 特征融合辅助模块 ────────────────────────────────────────────────────────────
 
+class SEGate(nn.Module):
+    """
+    Squeeze-Excitation 通道门控。
+    在三路特征拼接之前对 CNN 分支单独加权，防止 DINO 强预训练信号
+    在 1×1 线性压缩中覆盖 CNN 的局部纹理/边界特征。
+    """
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        mid = max(channels // reduction, 4)
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.gate(x).view(x.shape[0], x.shape[1], 1, 1)
+        return x * w
+
+class FusionBlock(nn.Module):
+    def __init__(self, in_ch: int, cnn_ch: int, sam_ch: int,
+                 dino_ch: int, out_ch: int = 256):
+        super().__init__()
+        # 三路各自独立门控，互不干扰
+        self.cnn_gate  = SEGate(cnn_ch)
+        self.sam_gate  = SEGate(sam_ch)
+        self.dino_gate = SEGate(dino_ch)
+
+        self.compress = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1,
+                      groups=out_ch, bias=False),
+            nn.Conv2d(out_ch, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, cnn_feat, sam_feat, dino_feat):
+        # 三路分别自适应调权，消除激活幅度不一致问题
+        return self.compress(torch.cat([
+            self.cnn_gate(cnn_feat),
+            self.sam_gate(sam_feat),
+            self.dino_gate(dino_feat),
+        ], dim=1))
 
 class SAM3DINOV3Mask2Former(nn.Module):
     def __init__(self, cfg):
         super().__init__()
+        # ── 编码器 ─────────────────────────────────────────────────────────
+        # ResNet-50 depth=5: get_encoder 返回 6 个张量，取 [2:] 得 4 层：
+        #   [0] (B,  256, 128, 128)  → res2
+        #   [1] (B,  512,  64,  64)  → res3
+        #   [2] (B, 1024,  32,  32)  → res4
+        #   [3] (B, 2048,  16,  16)  → res5
+        self.cnn_encoder = get_encoder('resnet50', in_channels=3, depth=5, weights='imagenet')
+        # SAM3: 输出 list[4]
+        #   [0] (B, 128, 128, 128)  → res2
+        #   [1] (B, 128,  64,  64)  → res3
+        #   [2] (B, 128,  32,  32)  → res4
+        #   [3] (B, 128,  16,  16)  → res5
         self.sam_encoder = SAM3Encoder(checkpoint_path=cfg.SAM.checkpoint_path, img_size=512)
+        # DINO-v3 (最后1个stage解冻): 输出 list[4]
+        #   [0] (B, 256, 512, 512)  ← 不使用
+        #   [1] (B, 256, 256, 256)  ← 不使用
+        #   [2] (B, 256, 128, 128)  → res2
+        #   [3] (B, 256,  64,  64)  → res3；插值↓→res4/res5
         self.dino_encoder = DinoEncoder(model_name="dinounet_l", pretrained_path=cfg.DINO.checkpoint_path, features_per_stage=[256, 256, 256, 256])
-        self.lea_modules = nn.ModuleDict()
-        self.cbam_modules = nn.ModuleDict()
-        self.fusion_modules = nn.ModuleDict()
-        feature_levels = ['res2', 'res3', 'res4', 'res5']
-        for i, level in enumerate(feature_levels):
-            self.fusion_modules[level] = nn.Sequential(
-                nn.Conv2d(128 + 256, 256, kernel_size=1, bias=False),
-                nn.BatchNorm2d(256),
-                nn.ReLU(inplace=True)
-            )
-            self.cbam_modules[level] = CBAM(256)
-            self.lea_modules[level] = LEA_Module(256)
-        self.backbone_feature_shape = dict()
-        for i, stride in zip([2, 3, 4, 5], [4, 8, 16, 32]):
-            self.backbone_feature_shape[f'res{i}'] = Dict({'channel': 256, 'stride': stride})
+        # ── SE 门控融合层 ──────────────────────────────────────────────────
+        # 三路拼接通道数（CNN + SAM + DINO）：
+        #   res2:  256 + 128 + 256 =  640，CNN 分支通道 = 256
+        #   res3:  512 + 128 + 256 =  896，CNN 分支通道 = 512
+        #   res4: 1024 + 128 + 256 = 1408，CNN 分支通道 = 1024
+        #   res5: 2048 + 128 + 256 = 2432，CNN 分支通道 = 2048
+        self.fusion_modules = nn.ModuleDict({
+            'res2': FusionBlock(640, cnn_ch=256, sam_ch=128, dino_ch=256),
+            'res3': FusionBlock(896, cnn_ch=512, sam_ch=128, dino_ch=256),
+            'res4': FusionBlock(1408, cnn_ch=1024, sam_ch=128, dino_ch=256),
+            'res5': FusionBlock(2432, cnn_ch=2048, sam_ch=128, dino_ch=256),
+        })
+        # ── Mask2Former Head ────────────────────────────────────────────────
+        self.backbone_feature_shape = {
+            f'res{i}': Dict({'channel': 256, 'stride': s})
+            for i, s in zip([2, 3, 4, 5], [4, 8, 16, 32])}
         self.sem_seg_head = MaskFormerHead(self.backbone_feature_shape, cfg)
         self.adb_height_head = AdaBinsHead(cfg.TRAIN.min_height, cfg.TRAIN.max_height)
-        self.boundary_head = BoundaryHead(256)
+
+        # 从最深层特征中提取整张图像唯一的投影偏角信息
+        self.global_view_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(2048, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 2)
+        )
+
+    @staticmethod
+    def _align(src: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        """双线性插值对齐到 ref 的空间尺寸，保留梯度，避免 max_pool 信息损失。"""
+        if src.shape[-2:] == ref.shape[-2:]:
+            return src
+        return F.interpolate(
+            src, size=ref.shape[-2:], mode='bilinear', align_corners=False
+        )
 
     def forward(self, x):
-        sam_features = self.sam_encoder(x)
-        dino_features = self.dino_encoder(x)        # DINO Features: {'res2', 'res3', 'res4', 'res5'}
+        cnn_all  = self.cnn_encoder(x)[2:]   # list[4]
+        sam_all  = self.sam_encoder(x)        # list[4]
+        dino_all = self.dino_encoder(x)       # list[4]      # DINO Features: {'res2', 'res3', 'res4', 'res5'}
+
+        # CNN: [2:] 后索引 0~3
+        c2 = cnn_all[0]    # (B,  256, 128, 128)
+        c3 = cnn_all[1]    # (B,  512,  64,  64)
+        c4 = cnn_all[2]    # (B, 1024,  32,  32)
+        c5 = cnn_all[3]    # (B, 2048,  16,  16)
+
+        # SAM: 索引 0~3，与 res2~res5 一一对应
+        s2 = sam_all[0]    # (B, 128, 128, 128)
+        s3 = sam_all[1]    # (B, 128,  64,  64)
+        s4 = sam_all[2]    # (B, 128,  32,  32)
+        s5 = sam_all[3]    # (B, 128,  16,  16)
+
+        # DINO: idx2→res2；idx3→res3，插值对齐到 res4/res5
+        d2 = dino_all[2]   # (B, 256, 128, 128)
+        d3 = dino_all[3]   # (B, 256,  64,  64)
+
+        # ── 2. 逐层对齐 + SE融合 ──────────────────────────────────────────
+        # res2: 三路均已在 128×128，无需对齐
+        f2 = self.fusion_modules['res2'](c2, s2, d2)
+        #   输入 (B,256,128,128)+(B,128,128,128)+(B,256,128,128) → (B,256,128,128)
+
+        # res3: 三路均已在 64×64，无需对齐
+        f3 = self.fusion_modules['res3'](c3, s3, d3)
+        #   输入 (B,512,64,64)+(B,128,64,64)+(B,256,64,64) → (B,256,64,64)
+
+        # res4: 目标 32×32；DINO d3(64²) 插值↓2x
+        d4 = self._align(d3, s4)             # (B, 256, 32, 32)
+        f4 = self.fusion_modules['res4'](c4, s4, d4)
+        #   输入 (B,1024,32,32)+(B,128,32,32)+(B,256,32,32) → (B,256,32,32)
+
+        # res5: 目标 16×16；DINO d3(64²) 插值↓4x
+        d5 = self._align(d3, s5)             # (B, 256, 16, 16)
+        f5 = self.fusion_modules['res5'](c5, s5, d5)
+        #   输入 (B,2048,16,16)+(B,128,16,16)+(B,256,16,16) → (B,256,16,16)
+
+        # ── 3. 送入 Mask2Former Decoder ────────────────────────────────────
+        enhanced_features = {
+            'res2': f2,   # (B, 256, 128, 128)  stride=4
+            'res3': f3,   # (B, 256,  64,  64)  stride=8
+            'res4': f4,   # (B, 256,  32,  32)  stride=16
+            'res5': f5,   # (B, 256,  16,  16)  stride=32
+        }
 
         # self._visualize_comparison(x, sam_features, dino_features, save_name="vis_feature_debug.png")
 
-        enhanced_features = {}        # 逐层 融合 & 增强
-        for i, level in enumerate(['res2', 'res3', 'res4', 'res5']):
-            f_sam = sam_features[i]
-            f_dino = F.max_pool2d(dino_features[i], kernel_size=4, stride=4)
-            f_fused = self.fusion_modules[level](torch.cat([f_sam, f_dino], dim=1))
-            enhanced_features[level] = self.lea_modules[level](self.cbam_modules[level](f_fused))
+        # 获取图像全局视角的偏移向量 (每米产生的归一化坐标偏移)
+        # 用 Tanh 限制极端值，假设 100米建筑极限偏移不超过图像边长的 20%
+        # 这里缩放系数 0.002 意味着：(100m * 0.002 = 0.2)，在 512 分辨率下大概是 100 像素
 
         # Decoder
         outputs = self.sem_seg_head(enhanced_features)
         outputs["pred_heights"] = self.adb_height_head(outputs.pop("height_feats"), outputs.pop("out_bins"))
-        outputs["pred_boundaries"] = self.boundary_head(outputs.pop("mask_feats"))
-
         if "aux_outputs" in outputs:# 计算中间层的高度预测
             for aux_out in outputs["aux_outputs"]:
                 aux_out["pred_heights"] = self.adb_height_head(aux_out.pop("height_feats"), aux_out.pop("out_bins")) # 这里的 height_feats 也是经过每一层的 FeatureAggregator (GCN) 计算出来的
