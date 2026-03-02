@@ -305,7 +305,8 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
         # output FFNs
         if self.mask_classification:
-            self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
+            # self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
+            self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
         # 原始mask2former到此结束
 
@@ -323,7 +324,8 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         self.height_regressor = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
         self.max_height = max_height
         self.min_height = min_height
-        self.feature_aggregator = FeatureAggregator(516, self.num_bins, nq=self.num_queries)
+        aggregator_dim = hidden_dim + mask_dim + 1 + 2
+        self.feature_aggregator = FeatureAggregator(aggregator_dim, hidden_dim, nq=self.num_queries)
 
 
     def forward(self, x, mask_features, mask = None):
@@ -349,7 +351,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
         # QxNxC [200, 6, 256]
         query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
-        output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
+        output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1) # (nq=120, B=2, 256)
 
         predictions_class = []
         predictions_mask = []
@@ -362,13 +364,15 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
         predictions_bins.append(output_bins)
+        predictions_height_feat_final.append(output_heights)
         gcn_feat_0 = self.feature_aggregator(
             output_heights,
-            outputs_class,
-            outputs_mask,
-            self.mask_embed(self.decoder_norm(output).transpose(0, 1))
+            outputs_class.detach().sigmoid(),
+            outputs_mask.detach().sigmoid(),
+            self.mask_embed(self.decoder_norm(output).transpose(0, 1)).detach()
         )
         predictions_height_feat_final.append(gcn_feat_0)
+        # output = output + gcn_feat_0.transpose(0, 1)
         # query_feat = self.decoder_norm(output).transpose(0, 1)
         # combined_height_feat = gcn_feat_0 + query_feat
         # predictions_height_feat_final.append(combined_height_feat)
@@ -401,27 +405,20 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
             outputs_class, outputs_mask, output_bins, out_heights, attn_mask = self.forward_prediction_heads(
                     output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels], idx=i + 1
                 )
-
-            # else:
-            #     outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
-            #         output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels], idx=i + 1
-            #     )
-            # 虽然输出了out_heights但是没有直接return，而是用来参与了self.feature_aggregator得到height_feats
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
             predictions_bins.append(output_bins)
+            # if i >= 5:
             gcn_feat_i = self.feature_aggregator(
                 output_heights,
-                outputs_class,
-                outputs_mask,
-                self.mask_embed(self.decoder_norm(output).transpose(0, 1))
+                outputs_class.detach().sigmoid(),
+                outputs_mask.detach().sigmoid(),
+                self.mask_embed(self.decoder_norm(output).transpose(0, 1)).detach()
             )
             predictions_height_feat_final.append(gcn_feat_i)
-            # query_feat = self.decoder_norm(output).transpose(0, 1)
-            # combined_height_feat = gcn_feat_i + query_feat
-            # predictions_height_feat_final.append(combined_height_feat)
-
-
+            # output = output + gcn_feat_i.transpose(0, 1)
+            # else:
+            #     predictions_height_feat_final.append(output_heights)
 
         assert len(predictions_class) == self.num_layers + 1
 
@@ -458,7 +455,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         # if idx == self.num_layers:
         bins_logits = self.bins_regressor(decoder_output)
         bins_widths = torch.relu(bins_logits) + 0.1
-        output_bins = bins_widths / bins_widths.sum(dim=1, keepdim=True)
+        output_bins = bins_widths / bins_widths.sum(dim=-1, keepdim=True)
         output_heights = self.height_regressor(decoder_output)
         return outputs_class, outputs_mask, output_bins, output_heights, attn_mask
 
