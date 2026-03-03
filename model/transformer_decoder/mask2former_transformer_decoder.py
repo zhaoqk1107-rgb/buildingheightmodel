@@ -8,7 +8,7 @@ from torch.nn import functional as F
 import logging
 
 from .position_encoding import PositionEmbeddingSine
-from .feature_aggregator import FeatureAggregator
+# from .feature_aggregator import FeatureAggregator
 
 class SelfAttentionLayer(nn.Module):
 
@@ -325,7 +325,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         self.max_height = max_height
         self.min_height = min_height
         aggregator_dim = hidden_dim + mask_dim + 1 + 2
-        self.feature_aggregator = FeatureAggregator(aggregator_dim, hidden_dim, nq=self.num_queries)
+        # self.feature_aggregator = FeatureAggregator(aggregator_dim, hidden_dim, nq=self.num_queries)
 
 
     def forward(self, x, mask_features, mask = None):
@@ -365,13 +365,13 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         predictions_mask.append(outputs_mask)
         predictions_bins.append(output_bins)
         predictions_height_feat_final.append(output_heights)
-        gcn_feat_0 = self.feature_aggregator(
-            output_heights,
-            outputs_class.detach().sigmoid(),
-            outputs_mask.detach().sigmoid(),
-            self.mask_embed(self.decoder_norm(output).transpose(0, 1)).detach()
-        )
-        predictions_height_feat_final.append(gcn_feat_0)
+        # gcn_feat_0 = self.feature_aggregator(
+        #     output_heights,
+        #     outputs_class.detach().sigmoid(),
+        #     outputs_mask.detach().sigmoid(),
+        #     self.mask_embed(self.decoder_norm(output).transpose(0, 1)).detach()
+        # )
+        # predictions_height_feat_final.append(gcn_feat_0)
         # output = output + gcn_feat_0.transpose(0, 1)
         # query_feat = self.decoder_norm(output).transpose(0, 1)
         # combined_height_feat = gcn_feat_0 + query_feat
@@ -408,14 +408,15 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
             predictions_bins.append(output_bins)
-            # if i >= 5:
-            gcn_feat_i = self.feature_aggregator(
-                out_heights,
-                outputs_class.detach().sigmoid(),
-                outputs_mask.detach().sigmoid(),
-                self.mask_embed(self.decoder_norm(output).transpose(0, 1)).detach()
-            )
-            predictions_height_feat_final.append(gcn_feat_i)
+            predictions_height_feat_final.append(out_heights)
+
+            # gcn_feat_i = self.feature_aggregator(
+            #     out_heights,
+            #     outputs_class.detach().sigmoid(),
+            #     outputs_mask.detach().sigmoid(),
+            #     self.mask_embed(self.decoder_norm(output).transpose(0, 1)).detach()
+            # )
+            # predictions_height_feat_final.append(gcn_feat_i)
             # output = output + gcn_feat_i.transpose(0, 1)
             # else:
             #     predictions_height_feat_final.append(output_heights)
@@ -437,7 +438,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         return out
 
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size, idx):
-        decoder_output = self.decoder_norm(output)
+        decoder_output = self.decoder_norm(output) # 这里是所有预测的源头
         decoder_output = decoder_output.transpose(0, 1)
         outputs_class = self.class_embed(decoder_output)
         mask_embed = self.mask_embed(decoder_output)
