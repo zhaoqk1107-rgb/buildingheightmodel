@@ -410,7 +410,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
             predictions_bins.append(output_bins)
             # if i >= 5:
             gcn_feat_i = self.feature_aggregator(
-                output_heights,
+                out_heights,
                 outputs_class.detach().sigmoid(),
                 outputs_mask.detach().sigmoid(),
                 self.mask_embed(self.decoder_norm(output).transpose(0, 1)).detach()
