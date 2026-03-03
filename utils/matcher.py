@@ -70,26 +70,6 @@ def batch_sigmoid_focal_loss(inputs, targets, alpha: float = 0.25, gamma: float 
     return loss / hw
 
 
-def compute_center_cost(pred_masks, tgt_masks):
-    H, W = pred_masks.shape[-2:]
-
-    ys = torch.linspace(0, 1, H, device=pred_masks.device)
-    xs = torch.linspace(0, 1, W, device=pred_masks.device)
-    grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
-
-    pred_prob = pred_masks.sigmoid()
-    pred_sum = pred_prob.flatten(1).sum(1).clamp(min=1e-6)
-    pred_cx = (pred_prob * grid_x).flatten(1).sum(1) / pred_sum
-    pred_cy = (pred_prob * grid_y).flatten(1).sum(1) / pred_sum
-
-    tgt_sum = tgt_masks.flatten(1).sum(1).clamp(min=1e-6)
-    tgt_cx = (tgt_masks * grid_x).flatten(1).sum(1) / tgt_sum
-    tgt_cy = (tgt_masks * grid_y).flatten(1).sum(1) / tgt_sum
-
-    dx = pred_cx.unsqueeze(1) - tgt_cx.unsqueeze(0)
-    dy = pred_cy.unsqueeze(1) - tgt_cy.unsqueeze(0)
-    center_cost = torch.sqrt(dx ** 2 + dy ** 2 + 1e-6)
-    return center_cost
 
 
 class HungarianMatcher(nn.Module):
@@ -155,7 +135,8 @@ class HungarianMatcher(nn.Module):
                 out_mask_sampled = out_mask_sampled.float()
                 tgt_mask_sampled = tgt_mask_sampled.float()
 
-                cost_mask = batch_sigmoid_focal_loss(out_mask_sampled, tgt_mask_sampled)
+                # cost_mask = batch_sigmoid_focal_loss(out_mask_sampled, tgt_mask_sampled)
+                cost_mask = batch_sigmoid_ce_loss(out_mask_sampled, tgt_mask_sampled)
                 cost_dice = batch_dice_loss(out_mask_sampled, tgt_mask_sampled)
 
             C = (self.cost_mask * cost_mask + self.cost_class * cost_class + self.cost_dice * cost_dice)
