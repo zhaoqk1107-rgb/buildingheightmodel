@@ -144,43 +144,7 @@ class SetCriterion(nn.Module):
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
 
-    # def loss_labels(self, outputs, targets, indices, num_masks):
-    #     assert "pred_logits" in outputs
-    #     src_logits = outputs["pred_logits"].float()
-    #     idx = self._get_src_permutation_idx(indices)
-    #     target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)]).to(self.device)
-    #     target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
-    #     target_classes[idx] = target_classes_o
-    #     loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes,
-    #                               self.empty_weight, label_smoothing=0.1, reduction='sum')/num_masks
-    #     del src_logits, target_classes, target_classes_o
-    #     return {"loss_ce": loss_ce}
 
-    # def loss_labels(self, outputs, targets, indices, num_masks):
-    #     """
-    #     [原汁原味 Mask2Former 修复]
-    #     放弃传统的 CrossEntropy，改用 Sigmoid Focal Loss 以解决严重漏提。
-    #     """
-    #     assert "pred_logits" in outputs
-    #     src_logits = outputs["pred_logits"].float()  # [B, num_queries, num_classes+1]
-    #
-    #     idx = self._get_src_permutation_idx(indices)
-    #     target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)]).to(self.device)
-    #
-    #     # 构造 Focal Loss 需要的 One-Hot 标签
-    #     target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
-    #     target_classes[idx] = target_classes_o
-    #
-    #     # 只取前景类的 Logits (索引为 0 的通道)，剔除背景通道
-    #     src_logits_fg = src_logits[..., 0]  # [B, num_queries]
-    #
-    #     # 生成 0/1 掩码，只有被匹配到的 Query 其 GT 才为 1
-    #     target_classes_onehot = torch.zeros_like(src_logits_fg)
-    #     target_classes_onehot[idx] = 1.0
-    #
-    #     loss_ce = sigmoid_focal_loss(src_logits_fg, target_classes_onehot, num_masks, alpha=0.25, gamma=2.0)
-    #
-    #     return {"loss_ce": loss_ce}
     def loss_labels(self, outputs, targets, indices, num_masks):
         assert "pred_logits" in outputs
         src_logits = outputs["pred_logits"].float()  # [B, num_queries, 1]
