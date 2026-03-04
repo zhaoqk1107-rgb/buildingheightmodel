@@ -6,7 +6,7 @@ import torch
 from torch import nn, Tensor
 from torch.nn import functional as F
 import logging
-
+import math
 from .position_encoding import PositionEmbeddingSine
 # from .feature_aggregator import FeatureAggregator
 
@@ -307,6 +307,10 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         if self.mask_classification:
             # self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
             self.class_embed = nn.Linear(hidden_dim, num_classes)
+            prior_prob = 0.01
+            bias_value = -math.log((1 - prior_prob) / prior_prob)
+            self.class_embed.bias.data = torch.ones(num_classes) * bias_value
+
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
         # 原始mask2former到此结束
 
