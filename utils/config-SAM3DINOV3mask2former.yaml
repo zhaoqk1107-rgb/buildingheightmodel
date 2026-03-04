@@ -3,7 +3,7 @@ project_name:
 
 DATASETS:
     datasets: ["Hongkong", "Chongqing", "Guangzhou", "Nanchang", "Nanjing", "Wuhan", "Xian"] #
-    num_sample: 5000
+    num_sample: 2500
     img_size: 512
 
 SAM:
@@ -34,7 +34,7 @@ MODEL:
         NORM: "GN"
         COMMON_STRIDE: 4
         NUM_CLASSES: 1
-        DEFORMABLE_TRANSFORMER_ENCODER_IN_FEATURES: ["res3", "res4", "res5"]
+        DEFORMABLE_TRANSFORMER_ENCODER_IN_FEATURES: ["res2", "res3", "res4"]
         TRANSFORMER_ENC_LAYERS: 6
         TRANSFORMER_DIM_FEEDFORWARD: 2048
 
