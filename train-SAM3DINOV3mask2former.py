@@ -173,8 +173,8 @@ class Trainer():
         total_loss_avg = 0
         # self.update_loss_weights(epoch)
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch + 1}/{self.CONFIG.TRAIN.epochs}")
-        self.optimizer.zero_grad()
         for i, (images, targets) in enumerate(pbar): # collate_fn 返回 (images, targets)
+            self.optimizer.zero_grad()
             images = images.to(self.device)
             # targets 已经是 list of dicts，不需要 prepare_targets 了
             targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
@@ -441,7 +441,7 @@ class Trainer():
             # 3. 赢得的比例必须足够高 (防止甜甜圈外圈)
             # overlap_threshold，默认值 0.6, 意味着如果一个 mask 赢下的面积不到它原始面积的 60%，它就会被丢弃
             original_area = (comp_masks_probs[k - 1] >= 0.5).sum().item() # 原始预测面积 (Original Area),对应 mask_pred_binary[k-1]
-            overlap_threshold = 0.6
+            overlap_threshold = 0.5
             if won_area > 0 and original_area > 0:
                 if won_area < overlap_threshold * original_area:
                     continue  # 剔除！这个 Mask 只是个“外圈”，丢弃它，这部分像素变回背景
