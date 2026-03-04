@@ -3,7 +3,7 @@ project_name:
 
 DATASETS:
     datasets: ["Hongkong", "Chongqing", "Guangzhou", "Nanchang", "Nanjing", "Wuhan", "Xian"] #
-    num_sample: 8000
+    num_sample: 5000
     img_size: 512
 
 SAM:
@@ -40,7 +40,7 @@ MODEL:
 
     MASK_FORMER:
             DEEP_SUPERVISION: True
-            NO_OBJECT_WEIGHT: 0.08
+            NO_OBJECT_WEIGHT: 0.1
 
             # loss
             CLASS_WEIGHT: 2.0 # class
@@ -50,12 +50,12 @@ MODEL:
 
             # transformer config
             HIDDEN_DIM: 256
-            NUM_OBJECT_QUERIES: 160 # 必须整除NHEADS
+            NUM_OBJECT_QUERIES: 320 # 必须整除NHEADS
             NHEADS: 8
             DROPOUT: 0.1
             DIM_FEEDFORWARD: 2048
             ENC_LAYERS: 0
-            PRE_NORM: False
+            PRE_NORM: True
             ENFORCE_INPUT_PROJ: False
             SIZE_DIVISIBILITY: 32
             DEC_LAYERS: 10  # 9 decoder layers, add one for the loss on learnable query
