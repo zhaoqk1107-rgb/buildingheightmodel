@@ -449,7 +449,6 @@ class Trainer():
                 final_height_map[won_mask] = comp_heights[k - 1]
         return instance_list, final_instance_map, final_height_map
 
-
     def validate_and_visualize(self, epoch):
         try:
             self.model.eval()
@@ -470,41 +469,52 @@ class Trainer():
                     target_size=images.shape[-2:],
                 )
 
-
             # --- 数据准备 ---
             img_vis = images[0].cpu().numpy().transpose(1, 2, 0)
+            # 反归一化 RGB 影像
             img_vis = (img_vis * [0.229, 0.224, 0.225] + [0.485, 0.456, 0.406]).clip(0, 1)
 
             gt_h_vis = targets[0]['height_map'].squeeze().cpu().numpy()
             pred_h_vis = height_map.cpu().numpy()
 
-            # --- 绘图 (1行 5列) ---
-            plt.figure(figsize=(14, 5))
+            # --- 新增：准备 GT 实例 (Reference Instances) 可视化数据 ---
+            # targets[0]['masks'] 的形状是 [N, H, W]
+            gt_masks = targets[0]['masks'].cpu()
+            h, w = gt_masks.shape[-2:]
+            gt_instance_map = np.zeros((h, w), dtype=np.int32)
 
+            # 将每个独立的 Mask 赋予一个唯一的 ID (i+1)，0 留作背景
+            for i, mask in enumerate(gt_masks):
+                gt_instance_map[mask.numpy() > 0.5] = i + 1
+            # --- 绘图 (1行 4列) ---
+            plt.figure(figsize=(18, 5))  # 适度加宽画布以容纳 4 张图
             # 1. Google Image
-            plt.subplot(1, 3, 1)
+            plt.subplot(1, 4, 1)
             plt.imshow(img_vis)
             plt.title(f"Google Image")
-            plt.colorbar()
             plt.axis('off')
-
             # 2. GT Height
-            plt.subplot(1, 3, 2)
+            plt.subplot(1, 4, 2)
             plt.imshow(gt_h_vis, cmap='RdYlBu_r')
             plt.title("Reference Height")
-            plt.colorbar()
+            plt.colorbar(fraction=0.046, pad=0.04)
             plt.axis('off')
-
-            # 5. Pred Height (预测实例高程)
-            plt.subplot(1, 3, 3)
+            # 3. GT Instances (新增：真实单体实例掩码)
+            plt.subplot(1, 4, 3)
+            # 使用 nipy_spectral 颜色映射，它包含非常丰富的对比色，0（背景）会显示为黑色
+            plt.imshow(gt_instance_map, cmap='nipy_spectral')
+            plt.title("Reference Instances")
+            plt.colorbar(fraction=0.046, pad=0.04)
+            plt.axis('off')
+            # 4. Pred Height (预测实例高程)
+            plt.subplot(1, 4, 4)
             plt.imshow(pred_h_vis, cmap='RdYlBu_r')
             plt.title("Predicted Height")
-            plt.colorbar()
+            plt.colorbar(fraction=0.046, pad=0.04)
             plt.axis('off')
 
             plt.savefig(os.path.join(self.CONFIG.TRAIN.log_dir, "visualizations", f"epoch_{epoch}.png"))
             plt.close()
-
         except Exception as e:
             print(f"可视化失败: {e}")
             import traceback
