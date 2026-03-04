@@ -102,10 +102,7 @@ def sigmoid_ce_loss(inputs, targets, num_masks):
     Returns:
         Loss tensor
     """
-    label_smoothing = 0.1
-    with torch.no_grad():
-        targets_smooth = targets * (1 - label_smoothing) + label_smoothing * 0.5
-    loss = F.binary_cross_entropy_with_logits(inputs, targets_smooth, reduction="none")
+    loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
     # 修复：使用 num_masks 进行归一化
     return loss.mean(1).sum() / num_masks
 
