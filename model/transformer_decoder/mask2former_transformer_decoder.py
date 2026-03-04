@@ -232,7 +232,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         nheads=8,
         dim_feedforward=2048,
         dec_layers=10,
-        pre_norm=False,
+        pre_norm=True,
         mask_dim=256,
         enforce_input_project=False,
         max_height=150,
@@ -289,6 +289,8 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         self.num_bins = num_bins
         # learnable query features
         self.query_feat = nn.Embedding(num_queries, hidden_dim)
+        nn.init.zeros_(self.query_feat.weight)
+
         # learnable query p.e.
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
 
