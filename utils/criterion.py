@@ -1,87 +1,37 @@
+# Copyright (c) Facebook, Inc. and its affiliates.
+# Modified by Bowen Cheng from https://github.com/facebookresearch/detr/blob/master/models/detr.py
+"""
+MaskFormer criterion.
+"""
+import logging
+
 import torch
 import torch.nn.functional as F
 from torch import nn
-from .misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list, get_world_size
+
+from detectron2.utils.comm import get_world_size
+from detectron2.projects.point_rend.point_features import (
+    get_uncertain_point_coords_with_randomness,
+    point_sample,
+)
+
+from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 
 
-# ==================================================================================
-# PointRend 核心工具函数 (复现自 detectron2)
-# ==================================================================================
-
-def point_sample(input, point_coords, **kwargs):
-    """
-    从 input feature map 中根据 point_coords 进行采样。
-    Args:
-        input: [N, C, H, W]
-        point_coords: [N, P, 2], 范围在 [0, 1] 之间
-    """
-    add_dim = False
-    if point_coords.dim() == 3:
-        add_dim = True
-        point_coords = point_coords.unsqueeze(2)
-
-    output = F.grid_sample(input, 2.0 * point_coords - 1.0, **kwargs)
-
-    if add_dim:
-        output = output.squeeze(3)
-    return output
-
-
-def calculate_uncertainty(logits):
-    """
-    计算二分类 logits 的不确定性。
-    logits 越接近 0 (概率 0.5)，不确定性越大。
-    我们用 -abs(logits) 来表示，值越大表示越不确定。
-    """
-    assert logits.shape[1] == 1
-    gt_class_logits = logits.clone()
-    return -(torch.abs(gt_class_logits))
-
-
-def get_uncertain_point_coords_with_randomness(
-        logits, num_points, oversample_ratio, importance_sample_ratio
+def dice_loss(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    num_masks: float,
 ):
     """
-    PointRend 的核心采样策略：
-    1. 随机采样更多的点 (num_points * oversample_ratio)。
-    2. 计算这些点的不确定性。
-    3. 选择最不确定的那些点 (based on importance_sample_ratio)。
-    4. 补充一些纯随机点，保持分布的多样性。
+    Compute the DICE loss, similar to generalized IOU for masks
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
     """
-    assert logits.shape[1] == 1, "Only support binary mask for point sampling"
-    batch_size = logits.shape[0]
-    num_sampled = int(num_points * importance_sample_ratio)
-    point_coords = torch.rand(batch_size, num_points, 2, device=logits.device)
-
-    if num_sampled <= 0:
-        return point_coords
-
-    # 1. 随机采样更多候选点
-    num_uncertain_points = int(num_points * oversample_ratio)
-    candidate_coords = torch.rand(batch_size, num_uncertain_points, 2, device=logits.device)
-
-    # 2. 获取这些点的预测值
-    candidate_logits = point_sample(logits, candidate_coords, align_corners=False)
-
-    # 3. 计算不确定性 & 选择 Top-K
-    uncertainty_map = calculate_uncertainty(candidate_logits)
-    _, idx = torch.topk(uncertainty_map.squeeze(1), num_sampled, dim=1)
-
-    # 4. 提取坐标
-    idx = idx.unsqueeze(-1).repeat(1, 1, 2)
-    chosen_coords = torch.gather(candidate_coords, 1, idx)
-
-    # 5. 拼接：最重要的点 + 剩余的纯随机点
-    if num_sampled < num_points:
-        random_coords = torch.rand(batch_size, num_points - num_sampled, 2, device=logits.device)
-        point_coords = torch.cat([chosen_coords, random_coords], dim=1)
-    else:
-        point_coords = chosen_coords
-
-    return point_coords
-
-
-def dice_loss(inputs, targets, num_masks):
     inputs = inputs.sigmoid()
     inputs = inputs.flatten(1)
     numerator = 2 * (inputs * targets).sum(-1)
@@ -90,7 +40,14 @@ def dice_loss(inputs, targets, num_masks):
     return loss.sum() / num_masks
 
 
-def sigmoid_ce_loss(inputs, targets, num_masks):
+dice_loss_jit = torch.jit.script(dice_loss)  # type: torch.jit.ScriptModule
+
+
+def sigmoid_ce_loss(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    num_masks: float,
+):
     """
     Args:
         inputs: A float tensor of arbitrary shape.
@@ -102,85 +59,168 @@ def sigmoid_ce_loss(inputs, targets, num_masks):
         Loss tensor
     """
     loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-    # 修复：使用 num_masks 进行归一化
+
     return loss.mean(1).sum() / num_masks
 
 
-# # 将这个工具函数加到 criterion.py 顶部
-# def sigmoid_focal_loss(inputs, targets, num_masks, alpha: float = 0.25, gamma: float = 2):
-#     """
-#     原版 Mask2Former 必备的分类 Focal Loss
-#     """
-#     prob = inputs.sigmoid()
-#     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-#     p_t = prob * targets + (1 - prob) * (1 - targets)
-#     loss = ce_loss * ((1 - p_t) ** gamma)
-#
-#     if alpha >= 0:
-#         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-#         loss = alpha_t * loss
-#
-#     return loss.mean(1).sum() / num_masks
+sigmoid_ce_loss_jit = torch.jit.script(sigmoid_ce_loss)  # type: torch.jit.ScriptModule
 
+
+def calculate_uncertainty(logits):
+    """
+    We estimate uncerainty as L1 distance between 0.0 and the logit prediction in 'logits' for the
+        foreground class in `classes`.
+    Args:
+        logits (Tensor): A tensor of shape (R, 1, ...) for class-specific or
+            class-agnostic, where R is the total number of predicted masks in all images and C is
+            the number of foreground classes. The values are logits.
+    Returns:
+        scores (Tensor): A tensor of shape (R, 1, ...) that contains uncertainty scores with
+            the most uncertain locations having the highest uncertainty score.
+    """
+    assert logits.shape[1] == 1
+    gt_class_logits = logits.clone()
+    return -(torch.abs(gt_class_logits))
 
 
 class SetCriterion(nn.Module):
-    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
-                 num_points, oversample_ratio, importance_sample_ratio, device):
+    """This class computes the loss for DETR.
+    The process happens in two steps:
+        1) we compute hungarian assignment between ground truth boxes and the outputs of the model
+        2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
+    """
+
+    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses, num_points, oversample_ratio, importance_sample_ratio):
+        """Create the criterion.
+        Parameters:
+            num_classes: number of object categories, omitting the special no-object category
+            matcher: module able to compute a matching between targets and proposals
+            weight_dict: dict containing as key the names of the losses and as values their relative weight.
+            eos_coef: relative classification weight applied to the no-object category
+            losses: list of all the losses to be applied. See get_loss for list of available losses.
+        """
         super().__init__()
         self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
         self.losses = losses
-        self.device = device
-        self.num_points = num_points
-        self.oversample_ratio = oversample_ratio
-        self.importance_sample_ratio = importance_sample_ratio
-        empty_weight = torch.ones(self.num_classes + 1, device=self.device)
+        empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[-1] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
 
+        # pointwise mask loss parameters
+        self.num_points = num_points
+        self.oversample_ratio = oversample_ratio
+        self.importance_sample_ratio = importance_sample_ratio
+
+    def loss_heights(self, outputs, targets, indices, num_masks):
+        """Offsets loss (NLL)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        assert "pred_offsets" in outputs
+        # shape [bs, nq=200, 1]
+        src_heights = outputs["pred_heights"].float()
+
+        # tuple ([n], [n])
+        idx = self._get_src_permutation_idx(indices)
+
+        # [n, 1]
+        target_heights_o = torch.cat([t["heights"].unsqueeze(1)[J] for t, (_, J) in zip(targets, indices)])
+        # shape [nq=200]
+        target_heights = torch.full(src_heights.shape, 0.0, dtype=torch.float32, device=src_heights.device)
+        target_heights[idx] = target_heights_o
+
+        mask = target_heights != 0.0
+
+        src_heights = src_heights[mask]
+        target_heights = target_heights[mask]
+
+        loss_height_l2 = F.mse_loss(src_heights, target_heights)
+        loss_height_l1 = F.l1_loss(src_heights, target_heights)
+        losses = {"loss_height_l2": loss_height_l2, "loss_height_l1": loss_height_l1}
+        if torch.isnan(loss_height_l2):
+            print(f"file_name: {outputs['file_name']}, nan, length_src: {src_heights}, length_tgt: {target_heights}")
+        elif torch.isinf(loss_height_l2):
+            print(f"file_name: {outputs['file_name']}, inf, length_src: {src_heights}, length_tgt: {target_heights}")
+
+        # print(
+        #     f"file_name: {outputs['file_name']}, length_src: {len(src_heights)}, length_tgt: {len(target_heights)}, loss_height_l2: {torch.sqrt(loss_height_l2)}; loss_height_l1: {loss_height_l1}"
+        # )
+        return losses
+
+    def loss_offsets(self, outputs, targets, indices, num_masks):
+        """Offsets loss (NLL)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        assert "pred_offsets" in outputs
+        # shape [bs, nq=200, 2]
+        src_offsets = outputs["pred_offsets"].float()
+
+        # tuple ([n], [n])
+        idx = self._get_src_permutation_idx(indices)
+
+        # [n, 2]
+        target_offsets_o = torch.cat([t["offsets"][J] for t, (_, J) in zip(targets, indices)])
+        # shape [bs, nq=200, 2]
+        target_offsets = torch.full(src_offsets.shape, 0.0, dtype=torch.float32, device=src_offsets.device)
+        target_offsets[idx] = target_offsets_o
+
+        loss_offset_l2 = F.mse_loss(src_offsets, target_offsets)
+        loss_offset_l1 = F.l1_loss(src_offsets, target_offsets)
+        losses = {"loss_offset_l2": loss_offset_l2, "loss_offset_l1": loss_offset_l1}
+        return losses
+
     def loss_labels(self, outputs, targets, indices, num_masks):
+        """Classification loss (NLL)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
         assert "pred_logits" in outputs
-        src_logits = outputs["pred_logits"].float()  # [B, num_queries, num_cls+1]
-        idx = self._get_src_permutation_idx(indices) # shape [n]
+        # shape [bs, nq=200, num_cls+1]
+        src_logits = outputs["pred_logits"].float()
+
+        idx = self._get_src_permutation_idx(indices)
+        # shape [n]
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        # shape [bs, nq=200]
         target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o
+
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
-        return {"loss_ce": loss_ce}
+        losses = {"loss_ce": loss_ce}
+        return losses
 
     def loss_masks(self, outputs, targets, indices, num_masks):
-        """
-        [关键修改] Mask Loss 计算：不再使用全图插值，而是使用 PointRend 采样策略。
-        这样可以让模型专注于优化“边缘”等难点，从而让输出更锐利（直角化）。
+        """Compute the losses related to the masks: the focal loss and the dice loss.
+        targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
         """
         assert "pred_masks" in outputs
 
-        # 1. 提取匹配好的 Pred Mask
         src_idx = self._get_src_permutation_idx(indices)
         tgt_idx = self._get_tgt_permutation_idx(indices)
+        src_masks = outputs["pred_masks"]
+        src_masks = src_masks[src_idx]
+        masks = [t["masks"] for t in targets]
+        # TODO use valid to mask invalid areas due to padding in loss
+        target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
+        target_masks = target_masks.to(src_masks)
+        target_masks = target_masks[tgt_idx]
 
-        src_masks = outputs["pred_masks"][src_idx]  # [N_matched, H_pred, W_pred]
-        src_masks = src_masks.unsqueeze(1)  # [N_matched, 1, H_pred, W_pred]
+        # No need to upsample predictions as we are using normalized coordinates :)
+        # N x 1 x H x W
+        src_masks = src_masks[:, None]
+        target_masks = target_masks[:, None]
 
-        # 2. 提取匹配好的 GT Mask
-        target_masks = [t["masks"] for t in targets]
-        target_masks, _ = nested_tensor_from_tensor_list(target_masks).decompose()
-        target_masks = target_masks.to(src_masks)[tgt_idx]  # [N_matched, H_gt, W_gt]
-        target_masks = target_masks.unsqueeze(1)  # [N_matched, 1, H_gt, W_gt]
-
-        # 3. [PointRend]
         with torch.no_grad():
-            # 1. 寻找网络当前着重刻画的边界点（位于屋顶）
+            # sample point_coords
             point_coords = get_uncertain_point_coords_with_randomness(
-                src_masks.detach(),
-                self.num_points,  # 12544
-                self.oversample_ratio,  # 3.0
-                self.importance_sample_ratio  # 0.75
+                src_masks,
+                lambda logits: calculate_uncertainty(logits),
+                self.num_points,
+                self.oversample_ratio,
+                self.importance_sample_ratio,
             )
-
+            # get gt labels
             point_labels = point_sample(
                 target_masks,
                 point_coords,
@@ -193,69 +233,87 @@ class SetCriterion(nn.Module):
             align_corners=False,
         ).squeeze(1)
 
-        # 6. 计算 Point-wise Loss
         losses = {
-            "loss_mask": sigmoid_ce_loss(point_logits, point_labels, num_masks),
-            "loss_dice": dice_loss(point_logits, point_labels, num_masks),
+            "loss_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
+            "loss_dice": dice_loss_jit(point_logits, point_labels, num_masks),
         }
-        del point_logits, target_masks, src_masks
+
+        del src_masks
+        del target_masks
         return losses
 
-
-
-    def loss_height(self, outputs, targets, indices, num_masks):
-        assert "pred_heights" in outputs
-        src_heights = outputs["pred_heights"]
-        idx = self._get_src_permutation_idx(indices)
-        matched_pred_heights = src_heights[idx]
-        target_heights = torch.cat([t["height_instances"][J].squeeze(1) for t, (_, J) in zip(targets, indices)]).to(self.device)
-        if matched_pred_heights.numel() == 0:
-            return {"loss_height_l1": src_heights.sum() * 0.0, "loss_height_l2": src_heights.sum() * 0.0}
-        del src_heights
-        matched_pred_heights = torch.log1p(matched_pred_heights.clamp(min=0))
-        target_heights   = torch.log1p(target_heights.clamp(min=0))
-        return {"loss_height_l1": F.l1_loss(matched_pred_heights, target_heights, reduction='sum')/num_masks,
-                "loss_height_l2": F.smooth_l1_loss(matched_pred_heights, target_heights, beta=1.0, reduction='sum') / num_masks}
-
     def _get_src_permutation_idx(self, indices):
+        # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
 
     def _get_tgt_permutation_idx(self, indices):
+        # permute targets following indices
         batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
     def get_loss(self, loss, outputs, targets, indices, num_masks):
         loss_map = {
-            'labels': self.loss_labels,
-            'masks': self.loss_masks,
-            'height': self.loss_height
-            # 'boundary': self.loss_boundary,  # 注册新 Loss
+            "labels": self.loss_labels,
+            "masks": self.loss_masks,
+            "offsets": self.loss_offsets,
+            "height": self.loss_heights,
         }
+        assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
 
     def forward(self, outputs, targets):
+        """This performs the loss computation.
+        Parameters:
+             outputs: dict of tensors, see the output specification of the model for the format
+             targets: list of dicts, such that len(targets) == batch_size.
+                      The expected keys in each dict depends on the losses applied, see each loss' doc
+        """
         outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
+
+        # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets)
 
+        # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_masks = sum(len(t["labels"]) for t in targets)
-        num_masks = torch.as_tensor([num_masks], dtype=torch.float, device=self.device)
+        num_masks = torch.as_tensor([num_masks], dtype=torch.float, device=next(iter(outputs.values())).device)
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_masks)
         num_masks = torch.clamp(num_masks / get_world_size(), min=1).item()
 
+        # Compute all the requested losses
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
 
+        # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if "aux_outputs" in outputs:
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
                 indices = self.matcher(aux_outputs, targets)
-                for loss in self.losses:
+                # TODO phase2
+                for loss in self.losses[:-1]:
+                    # # phase1
+                    # for loss in self.losses:
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_masks)
                     l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
         return losses
+
+    def __repr__(self):
+        head = "Criterion " + self.__class__.__name__
+        body = [
+            "matcher: {}".format(self.matcher.__repr__(_repr_indent=8)),
+            "losses: {}".format(self.losses),
+            "weight_dict: {}".format(self.weight_dict),
+            "num_classes: {}".format(self.num_classes),
+            "eos_coef: {}".format(self.eos_coef),
+            "num_points: {}".format(self.num_points),
+            "oversample_ratio: {}".format(self.oversample_ratio),
+            "importance_sample_ratio: {}".format(self.importance_sample_ratio),
+        ]
+        _repr_indent = 4
+        lines = [head] + [" " * _repr_indent + line for line in body]
+        return "\n".join(lines)
