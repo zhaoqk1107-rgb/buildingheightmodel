@@ -200,13 +200,21 @@ class Trainer():
             w_l1 = losses.get('loss_height_l1', torch.tensor(0.0)).item() * self.loss_weight_dict["loss_height_l1"]
             w_l2 = losses.get('loss_height_l2', torch.tensor(0.0)).item() * self.loss_weight_dict["loss_height_l2"]
 
-            if i % 2500 == 0:
+
+
+
+            if i % 100 == 0:
                 with torch.no_grad():
                     pm = outputs['pred_masks'].sigmoid()  # [B, Q, H, W]
                     coverage = pm.mean(dim=[2, 3])  # [B, Q]
                     print(f"Step {i} | Query coverage var: {coverage.var():.5f} "
                           f"| mean: {coverage.mean():.3f}")
                     # var < 0.001 → Query 仍然坍塌；var 随训练步数增大 → 分化正在发生。这个数字会告诉你方向对不对，不需要等一个完整 epoch 才能判断
+
+
+
+
+
 
             pbar.set_postfix({
                 "📉Loss": f"{total_loss.item():.2f}",
@@ -323,9 +331,9 @@ class Trainer():
 
                 # 对单张图片进行后处理推理
                 instance_list, instance_map, height_map = self.instance_inference(
-                    outputs['pred_logits'][k],
-                    outputs['pred_masks'][k],
-                    outputs['pred_heights'][k],
+                    outputs['pred_logits'][k], # torch.Size([320, ncl+1])
+                    outputs['pred_masks'][k], # torch.Size([320, 128, 128])
+                    outputs['pred_heights'][k], # torch.Size([320])
                     target_size=(h, w),
                 )
 
@@ -388,7 +396,7 @@ class Trainer():
 
         # 2. 计算分数 (Class Score * Mask Quality)
         # 不管分数多低，先取前 100 名。依靠 mAP 评估去惩罚低分误检。
-        class_prob = logits.sigmoid().squeeze(-1)
+        class_prob = logits.softmax(-1)[..., -1]
         num_queries = class_prob.shape[0]
         topk_num = min(100, num_queries)
         scores_per_image, topk_indices = class_prob.topk(topk_num, sorted=False)
