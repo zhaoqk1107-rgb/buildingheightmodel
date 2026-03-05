@@ -289,7 +289,6 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         self.num_bins = num_bins
         # learnable query features
         self.query_feat = nn.Embedding(num_queries, hidden_dim)
-        nn.init.normal_(self.query_feat.weight, mean=0.0, std=0.02)
         # learnable query p.e.
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         # level embedding (we always use 3 scales)
@@ -332,7 +331,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
 
     def forward(self, x, mask_features, mask = None):
-        # x is a list of multi-scale feature
+        # x is a list of multi-scale feature；x是transformer decoder得到的多尺度特征res2-4
         assert len(x) == self.num_feature_levels
         src = []
         pos = []
@@ -343,18 +342,22 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
         for i in range(self.num_feature_levels):
             size_list.append(x[i].shape[-2:])
-            pos.append(self.pe_layer(x[i], None).flatten(2))
+            pos.append(self.pe_layer(x[i], None).flatten(2)) # self.pe_layer 二维空间位置编码
             src.append(self.input_proj[i](x[i]).flatten(2) + self.level_embed.weight[i][None, :, None])
-
-            # flatten NxCxHxW to HWxNxC
-            pos[-1] = pos[-1].permute(2, 0, 1)
+            # self.input_proj 输入特征投影统一通道数
+            # self.level_embed.weight 尺度/层级位置编码；我们有 3 个特征图（对应大、中、小三个尺度）；当它们全被展平时，模型会混淆：“这个像素到底是来自高清图还是模糊图？”加上 level_embed，就区分开了它们的来源。
+            pos[-1] = pos[-1].permute(2, 0, 1)# flatten NxCxHxW to HWxNxC
             src[-1] = src[-1].permute(2, 0, 1)
 
         _, bs, _ = src[0].shape
 
         # QxNxC [200, 6, 256]
         query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
+        # query_embed (位置 Query / Positional Query)：
+        # 它是一个固定的、可学习的 256维向量。在整个前向传播中数值保持不变。它代表了侦探的“专属负责区域”。比如 1号侦探天生倾向于去画面左上角找，2号侦探倾向于去画面中间找。它告诉侦探“你在哪里”**。
         output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1) # (nq=120, B=2, 256)
+        # output （内容 Query / Content Query）
+        # 它初始时是一串可学习的向量，但在Decoder的每一层中会被不断更新。它代表了侦探脑子里的**“建筑物特征”。一开始侦探脑子里是空的（初始值），看了线索后，脑子里就形成了某栋楼的形状、纹理、高度信息。
 
         predictions_class = []
         predictions_mask = []
@@ -383,27 +386,42 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
-            # attention: cross-attention first
+
+            # ====== 插入这段调试代码 ======
+            if i == self.num_layers - 1:  # 只看最后一层
+                # attn_mask 形状是 [B*nheads, num_queries, HW]
+                # 统计每个 Query 关注的像素比例
+                focus_ratio = (~attn_mask[0]).float().mean(dim=-1)  # False 代表关注
+                print(f"\n[Debug] 最后一层 Query 平均关注图像的比例: {focus_ratio.mean().item():.4f}")
+                print(f"[Debug] 关注度最小的 Query 比例: {focus_ratio.min().item():.4f}")
+
+
+
+            # 🎯 掩膜交叉注意力
+            # 侦探（output）去现场（src）搜集线索，更新脑子里的特征。
+            # 为什么叫 Masked？ 因为有 attn_mask！侦探 1 号刚才预测了左上角有一栋楼，那它现在只能看左上角那栋楼相关的像素，其余背景和其他楼的像素全被“物理屏蔽”了！这使得每个侦探变得极度专注，也是 Mask2Former 能收敛如此之快的核心法宝。
             output = self.transformer_cross_attention_layers[i](
-                output, # [nq, b, 256]
-                src[level_index],  # [1024, b, 256], [4096, b, 256], [16384, b, 256]
-                memory_mask=attn_mask, # [nh, nq, 1024]
+                output, # [nq, b, 256] # 这是 Query (侦探)
+                src[level_index],  # [1024, b, 256], [4096, b, 256], [16384, b, 256] # 这是处理过的多尺度特征 x (案发现场线索)
+                memory_mask=attn_mask, # [nh, nq, 1024] # 掩码引导 (让 Query 只关注特定区域)
                 memory_key_padding_mask=None,  # here we do not apply masking on padded region
-                pos=pos[level_index], query_pos=query_embed
+                pos=pos[level_index],
+                query_pos=query_embed
             )
 
+            # 🎯 self-Attention (自注意力机制)
+            # 这是干嘛？ 160 个侦探开会交流。为什么交流？ 为了防止“抢功劳”。如果 1 号侦探和 2 号侦探发现他们找到的是同一栋楼，他们在 Self-Attention 中就会交换信息，最后其中一个会主动放弃（把自己的类别预测为背景），另一个保留。这代替了传统目标检测里繁琐的 NMS（非极大值抑制）操作。
             output = self.transformer_self_attention_layers[i](
                 output, tgt_mask=None,
                 tgt_key_padding_mask=None,
                 query_pos=query_embed
             )
             
-            # FFN
+            # 🎯 FFN(前馈神经网络)
+            # 这是干嘛？ 每个侦探自己回到办公室，把刚收集到的线索和同事开会的结果，用神经网络进行一次深度的整合和提炼。此时的output变得更加“聪明”和具体。
             output = self.transformer_ffn_layers[i](output)
-            # 这里的output就是transformer decoder的output： (B, nq=100, 256)？
 
-            '''对mask2former修改开始----全部都深层监督'''
-            # === 每一层都预测 Bins 和 Heights ===
+            # '''全部都深层监督'''
             # if i == self.num_layers - 1:
             outputs_class, outputs_mask, output_bins, out_heights, attn_mask = self.forward_prediction_heads(
                     output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels], idx=i + 1
@@ -441,10 +459,10 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         return out
 
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size, idx):
-        decoder_output = self.decoder_norm(output) # 这里是所有预测的源头
-        decoder_output = decoder_output.transpose(0, 1)
-        outputs_class = self.class_embed(decoder_output)
-        mask_embed = self.mask_embed(decoder_output)
+        decoder_output = self.decoder_norm(output) # 首先过一个 LayerNorm（decoder_norm），让数据分布更平滑，方便后续的线性层处理。
+        decoder_output = decoder_output.transpose(0, 1) # 把形状变成 [Batch, 160, 256]。这是为了迎合后面全连接层（Linear/MLP）的标准输入格式。
+        outputs_class = self.class_embed(decoder_output) # 线性层：身份鉴定（分类预测）-> [Batch, 160, Num_Classes]
+        mask_embed = self.mask_embed(decoder_output) # 简单的MLP
         outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
 
         # NOTE: prediction is of higher-resolution
@@ -455,7 +473,6 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
         attn_mask = attn_mask.detach()
 
-        '''修改部分: 高度分支也需要深层监督'''
         # if idx == self.num_layers:
         bins_logits = self.bins_regressor(decoder_output)
         bins_widths = torch.relu(bins_logits) + 0.1
