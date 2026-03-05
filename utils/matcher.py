@@ -87,59 +87,48 @@ class HungarianMatcher(nn.Module):
         indices = []
 
         for b in range(bs):
-            # 1. Class Cost (彻底重构为 Focal Cost)
-            # 此时的 outputs["pred_logits"] 已经被修复为 [B, num_queries, 1]
-            out_prob = outputs["pred_logits"][b].sigmoid()  # [num_queries, 1]
+            # 1. Class Cost
+            out_prob = outputs["pred_logits"][b].sigmoid()
+            tgt_ids = targets[b]["labels"]
+            cost_class = -out_prob[:, tgt_ids]
 
-            alpha = 0.25
-            gamma = 2.0
-
-            # 计算匹配到背景的代价 (负样本代价) 和匹配到目标的代价 (正样本代价)
-            neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-(1 - out_prob + 1e-8).log())
-            pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-(out_prob + 1e-8).log())
-
-            # 代价差值：匹配该目标的收益
-            cost_class = pos_cost_class - neg_cost_class  # [num_queries, 1]
-
-            # 获取当前图片中的 GT 数量
-            num_gt = targets[b]["labels"].shape[0]
-            # 因为只有 1 个前景类别(类别0)，任意 Query 分配给任意 GT 的分类代价都是相同的
-            # 我们将 [num_queries, 1] 的代价向量广播成 [num_queries, num_gt] 矩阵
-            if num_gt > 0:
-                cost_class = cost_class.repeat(1, num_gt)
-            else:
-                cost_class = torch.empty((num_queries, 0), device=out_prob.device)
-
-            # 2. Mask Cost (保持原有的优秀实现)
+            # 2. Mask Cost (使用 Point Sampling)
             out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
             tgt_mask = targets[b]["masks"].to(out_mask)  # [num_gt, H_gt, W_gt]
 
+
+            # 统一形状：[N, 1, H, W]
             out_mask = out_mask.unsqueeze(1)
             tgt_mask = tgt_mask.unsqueeze(1)
 
             point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
 
-            out_mask_sampled = point_sample(
+            out_mask = point_sample(
                 out_mask,
                 point_coords.repeat(out_mask.shape[0], 1, 1),
                 align_corners=False
             ).squeeze(1)
 
-            tgt_mask_sampled = point_sample(
+            # 在 GT Mask 上采样
+            # tgt_mask: [num_gt, 1, H, W] -> sample -> [num_gt, num_points]
+            tgt_mask = point_sample(
                 tgt_mask,
                 point_coords.repeat(tgt_mask.shape[0], 1, 1),
                 align_corners=False
             ).squeeze(1)
 
             with autocast(enabled=False):
-                out_mask_sampled = out_mask_sampled.float()
-                tgt_mask_sampled = tgt_mask_sampled.float()
+                out_mask = out_mask.float()
+                tgt_mask = tgt_mask.float()
 
-                # cost_mask = batch_sigmoid_focal_loss(out_mask_sampled, tgt_mask_sampled)
-                cost_mask = batch_sigmoid_ce_loss(out_mask_sampled, tgt_mask_sampled)
-                cost_dice = batch_dice_loss(out_mask_sampled, tgt_mask_sampled)
+                # 计算 Cost (基于采样点)
+                # cost_mask = batch_sigmoid_ce_loss(out_mask_sampled, tgt_mask_sampled)
+                # Mask2Former/BDHNet 这里通常用 Focal Loss
+                cost_mask = batch_sigmoid_focal_loss(out_mask, tgt_mask)
+                cost_dice = batch_dice_loss(out_mask, tgt_mask)
+                # cost_dice = batch_sigmoid_tversky_loss(out_mask_sampled, tgt_mask_sampled, alpha=0.7, beta=0.3)
 
-            C = (self.cost_mask * cost_mask + self.cost_class * cost_class + self.cost_dice * cost_dice)
+            C = (self.cost_mask * cost_mask + self.cost_class * cost_class + self.cost_dice * cost_dice )
 
             C = C.reshape(num_queries, -1).cpu()
 

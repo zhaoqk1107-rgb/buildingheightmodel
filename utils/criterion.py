@@ -121,7 +121,7 @@ def sigmoid_focal_loss(inputs, targets, num_masks, alpha: float = 0.25, gamma: f
         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
 
-    return loss.sum() / num_masks
+    return loss.mean(1).sum() / num_masks
 
 
 
@@ -135,10 +135,6 @@ class SetCriterion(nn.Module):
         self.eos_coef = eos_coef
         self.losses = losses
         self.device = device
-
-        empty_weight = torch.ones(self.num_classes + 1).to(device)
-        empty_weight[-1] = self.eos_coef
-        self.register_buffer("empty_weight", empty_weight)
 
         self.num_points = num_points
         self.oversample_ratio = oversample_ratio
@@ -170,11 +166,12 @@ class SetCriterion(nn.Module):
 
         # 1. 提取匹配好的 Pred Mask
         src_idx = self._get_src_permutation_idx(indices)
+        tgt_idx = self._get_tgt_permutation_idx(indices)
+
         src_masks = outputs["pred_masks"][src_idx]  # [N_matched, H_pred, W_pred]
         src_masks = src_masks.unsqueeze(1)  # [N_matched, 1, H_pred, W_pred]
 
         # 2. 提取匹配好的 GT Mask
-        tgt_idx = self._get_tgt_permutation_idx(indices)
         target_masks = [t["masks"] for t in targets]
         target_masks, _ = nested_tensor_from_tensor_list(target_masks).decompose()
         target_masks = target_masks.to(src_masks)[tgt_idx]  # [N_matched, H_gt, W_gt]
