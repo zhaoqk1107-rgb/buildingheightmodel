@@ -51,23 +51,23 @@ def batch_sigmoid_ce_loss(inputs: torch.Tensor, targets: torch.Tensor):
     return loss / hw
 
 
-def batch_sigmoid_focal_loss(inputs, targets, alpha: float = 0.25, gamma: float = 2):
-    hw = inputs.shape[1]
-
-    prob = inputs.sigmoid()
-    focal_pos = ((1 - prob) ** gamma) * F.binary_cross_entropy_with_logits(
-        inputs, torch.ones_like(inputs), reduction="none"
-    )
-    focal_neg = (prob ** gamma) * F.binary_cross_entropy_with_logits(
-        inputs, torch.zeros_like(inputs), reduction="none"
-    )
-    if alpha >= 0:
-        focal_pos = focal_pos * alpha
-        focal_neg = focal_neg * (1 - alpha)
-
-    loss = torch.einsum("nc,mc->nm", focal_pos, targets) + torch.einsum("nc,mc->nm", focal_neg, (1 - targets))
-
-    return loss / hw
+# def batch_sigmoid_focal_loss(inputs, targets, alpha: float = 0.25, gamma: float = 2):
+#     hw = inputs.shape[1]
+#
+#     prob = inputs.sigmoid()
+#     focal_pos = ((1 - prob) ** gamma) * F.binary_cross_entropy_with_logits(
+#         inputs, torch.ones_like(inputs), reduction="none"
+#     )
+#     focal_neg = (prob ** gamma) * F.binary_cross_entropy_with_logits(
+#         inputs, torch.zeros_like(inputs), reduction="none"
+#     )
+#     if alpha >= 0:
+#         focal_pos = focal_pos * alpha
+#         focal_neg = focal_neg * (1 - alpha)
+#
+#     loss = torch.einsum("nc,mc->nm", focal_pos, targets) + torch.einsum("nc,mc->nm", focal_neg, (1 - targets))
+#
+#     return loss / hw
 
 
 
@@ -78,8 +78,34 @@ class HungarianMatcher(nn.Module):
         self.cost_class = cost_class
         self.cost_mask = cost_mask
         self.cost_dice = cost_dice
+        self.cost_center = 2
         assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
         self.num_points = num_points
+
+
+    @staticmethod
+    def _mask_centers(mask: torch.Tensor, threshold: float = 0.5):
+        """
+        计算 mask 的归一化中心坐标。
+        输入: [N, H, W]，输出: [N, 2] (x, y), 范围 [0, 1].
+        对空 mask 使用图像中心作为回退值，避免 NaN。
+        """
+        n, h, w = mask.shape
+        bin_mask = (mask > threshold).float()
+        mass = bin_mask.sum(dim=(1, 2), keepdim=False)
+
+        ys = torch.linspace(0, 1, steps=h, device=mask.device, dtype=mask.dtype).view(1, h, 1)
+        xs = torch.linspace(0, 1, steps=w, device=mask.device, dtype=mask.dtype).view(1, 1, w)
+
+        cy = (bin_mask * ys).sum(dim=(1, 2)) / (mass + 1e-6)
+        cx = (bin_mask * xs).sum(dim=(1, 2)) / (mass + 1e-6)
+
+        centers = torch.stack([cx, cy], dim=-1)
+        fallback = torch.full_like(centers, 0.5)
+        valid = (mass > 0).unsqueeze(-1)
+        centers = torch.where(valid, centers, fallback)
+        return centers
+
 
     @torch.no_grad()
     def memory_efficient_forward(self, outputs, targets):
@@ -88,7 +114,7 @@ class HungarianMatcher(nn.Module):
 
         for b in range(bs):
             # 1. Class Cost
-            out_prob = outputs["pred_logits"][b].sigmoid()
+            out_prob = outputs["pred_logits"][b].softmax(-1)
             tgt_ids = targets[b]["labels"]
             cost_class = -out_prob[:, tgt_ids]
 
@@ -122,13 +148,15 @@ class HungarianMatcher(nn.Module):
                 tgt_mask = tgt_mask.float()
 
                 # 计算 Cost (基于采样点)
-                # cost_mask = batch_sigmoid_ce_loss(out_mask_sampled, tgt_mask_sampled)
-                # Mask2Former/BDHNet 这里通常用 Focal Loss
-                cost_mask = batch_sigmoid_focal_loss(out_mask, tgt_mask)
+                cost_mask = batch_sigmoid_ce_loss(out_mask, tgt_mask)
                 cost_dice = batch_dice_loss(out_mask, tgt_mask)
-                # cost_dice = batch_sigmoid_tversky_loss(out_mask_sampled, tgt_mask_sampled, alpha=0.7, beta=0.3)
 
-            C = (self.cost_mask * cost_mask + self.cost_class * cost_class + self.cost_dice * cost_dice )
+                pred_centers = self._mask_centers(outputs["pred_masks"][b].sigmoid())
+                tgt_centers = self._mask_centers(targets[b]["masks"].to(out_mask).float())
+                cost_center = torch.cdist(pred_centers, tgt_centers, p=1)
+
+
+            C = (self.cost_mask * cost_mask + self.cost_class * cost_class + self.cost_dice * cost_dice + self.cost_center * cost_center)
 
             C = C.reshape(num_queries, -1).cpu()
 

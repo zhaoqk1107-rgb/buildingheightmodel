@@ -20,7 +20,6 @@ def point_sample(input, point_coords, **kwargs):
         add_dim = True
         point_coords = point_coords.unsqueeze(2)
 
-    # grid_sample 期望坐标在 [-1, 1]，我们需要把 [0, 1] 映射过去
     output = F.grid_sample(input, 2.0 * point_coords - 1.0, **kwargs)
 
     if add_dim:
@@ -107,21 +106,21 @@ def sigmoid_ce_loss(inputs, targets, num_masks):
     return loss.mean(1).sum() / num_masks
 
 
-# 将这个工具函数加到 criterion.py 顶部
-def sigmoid_focal_loss(inputs, targets, num_masks, alpha: float = 0.25, gamma: float = 2):
-    """
-    原版 Mask2Former 必备的分类 Focal Loss
-    """
-    prob = inputs.sigmoid()
-    ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-    p_t = prob * targets + (1 - prob) * (1 - targets)
-    loss = ce_loss * ((1 - p_t) ** gamma)
-
-    if alpha >= 0:
-        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-        loss = alpha_t * loss
-
-    return loss.mean(1).sum() / num_masks
+# # 将这个工具函数加到 criterion.py 顶部
+# def sigmoid_focal_loss(inputs, targets, num_masks, alpha: float = 0.25, gamma: float = 2):
+#     """
+#     原版 Mask2Former 必备的分类 Focal Loss
+#     """
+#     prob = inputs.sigmoid()
+#     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+#     p_t = prob * targets + (1 - prob) * (1 - targets)
+#     loss = ce_loss * ((1 - p_t) ** gamma)
+#
+#     if alpha >= 0:
+#         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+#         loss = alpha_t * loss
+#
+#     return loss.mean(1).sum() / num_masks
 
 
 
@@ -135,26 +134,21 @@ class SetCriterion(nn.Module):
         self.eos_coef = eos_coef
         self.losses = losses
         self.device = device
-
         self.num_points = num_points
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
-
+        empty_weight = torch.ones(self.num_classes + 1, device=self.device)
+        empty_weight[-1] = self.eos_coef
+        self.register_buffer("empty_weight", empty_weight)
 
     def loss_labels(self, outputs, targets, indices, num_masks):
         assert "pred_logits" in outputs
-        src_logits = outputs["pred_logits"].float()  # [B, num_queries, 1]
-
-        idx = self._get_src_permutation_idx(indices)
-
-        # 你的 target_classes_o 都是 0（因为 dataset.py 里 append 的是 0）
-        # 我们直接构造 0/1 的二值掩码，被匹配到的 Query 设为 1.0，其余为 0.0
-        target_classes_onehot = torch.zeros_like(src_logits)  # [B, num_queries, 1]
-        target_classes_onehot[idx] = 1.0
-
-        # 直接传入 1 通道的 logits 计算 Sigmoid Focal Loss
-        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_masks, alpha=0.25, gamma=2.0)
-
+        src_logits = outputs["pred_logits"].float()  # [B, num_queries, num_cls+1]
+        idx = self._get_src_permutation_idx(indices) # shape [n]
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_classes_o
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
         return {"loss_ce": loss_ce}
 
     def loss_masks(self, outputs, targets, indices, num_masks):
