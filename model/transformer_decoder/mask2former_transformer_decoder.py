@@ -1,18 +1,14 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 # Modified by Bowen Cheng from: https://github.com/facebookresearch/detr/blob/master/models/detr.py
-import logging
 import fvcore.nn.weight_init as weight_init
 from typing import Optional
 import torch
 from torch import nn, Tensor
 from torch.nn import functional as F
-
-from detectron2.config import configurable
-from detectron2.layers import Conv2d
-
+import logging
+import math
 from .position_encoding import PositionEmbeddingSine
-from .maskformer_transformer_decoder import TRANSFORMER_DECODER_REGISTRY
-
+# from .feature_aggregator import FeatureAggregator
 
 class SelfAttentionLayer(nn.Module):
 
@@ -204,14 +200,9 @@ class MLP(nn.Module):
         return x
 
 
-@TRANSFORMER_DECODER_REGISTRY.register()
 class MultiScaleMaskedTransformerDecoder(nn.Module):
-
     _version = 2
-
-    def _load_from_state_dict(
-        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-    ):
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         version = local_metadata.get("version", None)
         if version is None or version < 2:
             # Do not warn if train from scratch
@@ -228,43 +219,26 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
             if not scratch:
                 logger.warning(
-                    f"Weight format of {self.__class__.__name__} have changed! "
-                    "Please upgrade your models. Applying automatic conversion now ..."
-                )
+                    f"Weight format of {self.__class__.__name__} have changed! " "Please upgrade your models. Applying automatic conversion now ..."
+                )    
 
-    @configurable
     def __init__(
         self,
         in_channels,
-        mask_classification=True,
-        *,
-        num_classes: int,
-        hidden_dim: int,
-        num_queries: int,
-        nheads: int,
-        dim_feedforward: int,
-        dec_layers: int,
-        pre_norm: bool,
-        mask_dim: int,
-        enforce_input_project: bool,
+        num_classes,
+        mask_classification=True,  
+        hidden_dim=256,
+        num_queries=100,
+        nheads=8,
+        dim_feedforward=2048,
+        dec_layers=10,
+        pre_norm=True,
+        mask_dim=256,
+        enforce_input_project=False,
+        max_height=150,
+        min_height=0,
+        num_bins=128
     ):
-        """
-        NOTE: this interface is experimental.
-        Args:
-            in_channels: channels of the input features
-            mask_classification: whether to add mask classifier or not
-            num_classes: number of classes
-            hidden_dim: Transformer feature dimension
-            num_queries: number of queries
-            nheads: number of heads
-            dim_feedforward: feature dimension in feedforward network
-            enc_layers: number of Transformer encoder layers
-            dec_layers: number of Transformer decoder layers
-            pre_norm: whether to use pre-LayerNorm or not
-            mask_dim: mask feature dimension
-            enforce_input_project: add input project 1x1 conv even if input
-                channels and hidden dim is identical
-        """
         super().__init__()
 
         assert mask_classification, "Only support mask classification model"
@@ -312,18 +286,19 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         self.decoder_norm = nn.LayerNorm(hidden_dim)
 
         self.num_queries = num_queries
+        self.num_bins = num_bins
         # learnable query features
         self.query_feat = nn.Embedding(num_queries, hidden_dim)
+        nn.init.normal_(self.query_feat.weight, mean=0.0, std=0.02)
         # learnable query p.e.
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
-
         # level embedding (we always use 3 scales)
         self.num_feature_levels = 3
         self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
         self.input_proj = nn.ModuleList()
         for _ in range(self.num_feature_levels):
             if in_channels != hidden_dim or enforce_input_project:
-                self.input_proj.append(Conv2d(in_channels, hidden_dim, kernel_size=1))
+                self.input_proj.append(nn.Conv2d(in_channels, hidden_dim, kernel_size=1))
                 weight_init.c2_xavier_fill(self.input_proj[-1])
             else:
                 self.input_proj.append(nn.Sequential())
@@ -331,34 +306,30 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         # output FFNs
         if self.mask_classification:
             self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
+            prior_prob = 0.01
+            bias_value = -math.log((1 - prior_prob) / prior_prob)
+            self.class_embed.bias.data = torch.ones(num_classes) * bias_value
+
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+        # 原始mask2former到此结束
 
-    @classmethod
-    def from_config(cls, cfg, in_channels, mask_classification):
-        ret = {}
-        ret["in_channels"] = in_channels
-        ret["mask_classification"] = mask_classification
-        
-        ret["num_classes"] = cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES
-        ret["hidden_dim"] = cfg.MODEL.MASK_FORMER.HIDDEN_DIM
-        ret["num_queries"] = cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES
-        # Transformer parameters:
-        ret["nheads"] = cfg.MODEL.MASK_FORMER.NHEADS
-        ret["dim_feedforward"] = cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD
+        '''修改添加部分，添加高度回归的解码器分支'''
+        self.bins_regressor = nn.Sequential(nn.Linear(hidden_dim, hidden_dim),
+                                            nn.LeakyReLU(),
+                                            nn.Linear(hidden_dim, hidden_dim),
+                                            nn.LeakyReLU(),
+                                            nn.Linear(hidden_dim, self.num_bins))
+        self.bins_classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(inplace=True),
+            nn.Linear(hidden_dim, self.num_bins)
+        )
+        self.height_regressor = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
+        self.max_height = max_height
+        self.min_height = min_height
+        aggregator_dim = hidden_dim + mask_dim + 1 + 2
+        # self.feature_aggregator = FeatureAggregator(aggregator_dim, hidden_dim, nq=self.num_queries)
 
-        # NOTE: because we add learnable query features which requires supervision,
-        # we add minus 1 to decoder layers to be consistent with our loss
-        # implementation: that is, number of auxiliary losses is always
-        # equal to number of decoder layers. With learnable query features, the number of
-        # auxiliary losses equals number of decoders plus 1.
-        assert cfg.MODEL.MASK_FORMER.DEC_LAYERS >= 1
-        ret["dec_layers"] = cfg.MODEL.MASK_FORMER.DEC_LAYERS - 1
-        ret["pre_norm"] = cfg.MODEL.MASK_FORMER.PRE_NORM
-        ret["enforce_input_project"] = cfg.MODEL.MASK_FORMER.ENFORCE_INPUT_PROJ
-
-        ret["mask_dim"] = cfg.MODEL.SEM_SEG_HEAD.MASK_DIM
-
-        return ret
 
     def forward(self, x, mask_features, mask = None):
         # x is a list of multi-scale feature
@@ -381,25 +352,42 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
         _, bs, _ = src[0].shape
 
-        # QxNxC
+        # QxNxC [200, 6, 256]
         query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
-        output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
+        output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1) # (nq=120, B=2, 256)
 
         predictions_class = []
         predictions_mask = []
+        predictions_bins = []
+        predictions_height_feat_final = [] # 存储经过 GCN 后的特征
 
         # prediction heads on learnable query features
-        outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[0])
+        outputs_class, outputs_mask, output_bins, output_heights, attn_mask = self.forward_prediction_heads(
+            output, mask_features, attn_mask_target_size=size_list[0], idx=0)
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
+        predictions_bins.append(output_bins)
+        predictions_height_feat_final.append(output_heights)
+        # gcn_feat_0 = self.feature_aggregator(
+        #     output_heights,
+        #     outputs_class.detach().sigmoid(),
+        #     outputs_mask.detach().sigmoid(),
+        #     self.mask_embed(self.decoder_norm(output).transpose(0, 1)).detach()
+        # )
+        # predictions_height_feat_final.append(gcn_feat_0)
+        # output = output + gcn_feat_0.transpose(0, 1)
+        # query_feat = self.decoder_norm(output).transpose(0, 1)
+        # combined_height_feat = gcn_feat_0 + query_feat
+        # predictions_height_feat_final.append(combined_height_feat)
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
             # attention: cross-attention first
             output = self.transformer_cross_attention_layers[i](
-                output, src[level_index],
-                memory_mask=attn_mask,
+                output, # [nq, b, 256]
+                src[level_index],  # [1024, b, 256], [4096, b, 256], [16384, b, 256]
+                memory_mask=attn_mask, # [nh, nq, 1024]
                 memory_key_padding_mask=None,  # here we do not apply masking on padded region
                 pos=pos[level_index], query_pos=query_embed
             )
@@ -411,27 +399,49 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
             )
             
             # FFN
-            output = self.transformer_ffn_layers[i](
-                output
-            )
+            output = self.transformer_ffn_layers[i](output)
+            # 这里的output就是transformer decoder的output： (B, nq=100, 256)？
 
-            outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels])
+            '''对mask2former修改开始----全部都深层监督'''
+            # === 每一层都预测 Bins 和 Heights ===
+            # if i == self.num_layers - 1:
+            outputs_class, outputs_mask, output_bins, out_heights, attn_mask = self.forward_prediction_heads(
+                    output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels], idx=i + 1
+                )
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
+            predictions_bins.append(output_bins)
+            predictions_height_feat_final.append(out_heights)
+
+            # gcn_feat_i = self.feature_aggregator(
+            #     out_heights,
+            #     outputs_class.detach().sigmoid(),
+            #     outputs_mask.detach().sigmoid(),
+            #     self.mask_embed(self.decoder_norm(output).transpose(0, 1)).detach()
+            # )
+            # predictions_height_feat_final.append(gcn_feat_i)
+            # output = output + gcn_feat_i.transpose(0, 1)
+            # else:
+            #     predictions_height_feat_final.append(output_heights)
 
         assert len(predictions_class) == self.num_layers + 1
 
         out = {
-            'pred_logits': predictions_class[-1],
-            'pred_masks': predictions_mask[-1],
+            'pred_logits': predictions_class[-1], # [b, nq=200, n_cls=2]
+            'pred_masks': predictions_mask[-1], # [b, nq=200,168, 168]
             'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask
-            )
+                predictions_class if self.mask_classification else None,
+                predictions_mask,
+                predictions_bins,
+                predictions_height_feat_final # 传入经过 GCN 的特征
+            ),
+            "out_bins": predictions_bins[-1],
+            "height_feats": predictions_height_feat_final[-1],
         }
         return out
 
-    def forward_prediction_heads(self, output, mask_features, attn_mask_target_size):
-        decoder_output = self.decoder_norm(output)
+    def forward_prediction_heads(self, output, mask_features, attn_mask_target_size, idx):
+        decoder_output = self.decoder_norm(output) # 这里是所有预测的源头
         decoder_output = decoder_output.transpose(0, 1)
         outputs_class = self.class_embed(decoder_output)
         mask_embed = self.mask_embed(decoder_output)
@@ -445,17 +455,26 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
         attn_mask = attn_mask.detach()
 
-        return outputs_class, outputs_mask, attn_mask
+        '''修改部分: 高度分支也需要深层监督'''
+        # if idx == self.num_layers:
+        bins_logits = self.bins_regressor(decoder_output)
+        bins_widths = torch.relu(bins_logits) + 0.1
+        output_bins = bins_widths / bins_widths.sum(dim=-1, keepdim=True)
+        output_heights = self.height_regressor(decoder_output)
+        return outputs_class, outputs_mask, output_bins, output_heights, attn_mask
+
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_seg_masks):
-        # this is a workaround to make torchscript happy, as torchscript
-        # doesn't support dictionary with non-homogeneous values, such
-        # as a dict having both a Tensor and a list.
+    def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_bins, outputs_height_feats):
         if self.mask_classification:
             return [
-                {"pred_logits": a, "pred_masks": b}
-                for a, b in zip(outputs_class[:-1], outputs_seg_masks[:-1])
+                {
+                    "pred_logits": a,
+                    "pred_masks": b,
+                    "out_bins": c,
+                    "height_feats": d # 这里存的是 GCN 后的特征
+                }
+                for a, b, c, d in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_bins[:-1], outputs_height_feats[:-1])
             ]
         else:
-            return [{"pred_masks": b} for b in outputs_seg_masks[:-1]]
+            return [{"pred_masks": b, "out_bins": c, "height_feats": d} for b, c, d in zip(outputs_seg_masks[:-1], outputs_bins[:-1], outputs_height_feats[:-1])]
