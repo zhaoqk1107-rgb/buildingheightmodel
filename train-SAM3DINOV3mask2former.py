@@ -200,6 +200,14 @@ class Trainer():
             w_l1 = losses.get('loss_height_l1', torch.tensor(0.0)).item() * self.loss_weight_dict["loss_height_l1"]
             w_l2 = losses.get('loss_height_l2', torch.tensor(0.0)).item() * self.loss_weight_dict["loss_height_l2"]
 
+            if i % 2500 == 0:
+                with torch.no_grad():
+                    pm = outputs['pred_masks'].sigmoid()  # [B, Q, H, W]
+                    coverage = pm.mean(dim=[2, 3])  # [B, Q]
+                    print(f"Step {i} | Query coverage var: {coverage.var():.5f} "
+                          f"| mean: {coverage.mean():.3f}")
+                    # var < 0.001 → Query 仍然坍塌；var 随训练步数增大 → 分化正在发生。这个数字会告诉你方向对不对，不需要等一个完整 epoch 才能判断
+
             pbar.set_postfix({
                 "📉Loss": f"{total_loss.item():.2f}",
                 "Class": f"{w_ce:.2f}",
@@ -360,7 +368,7 @@ class Trainer():
         return metrics, avg_val_loss
 
     @torch.no_grad()
-    def instance_inference(self, logits, mask_pred, height_pred, target_size, threshold=0.01):
+    def instance_inference(self, logits, mask_pred, height_pred, target_size, threshold=0.05):
         """
         Refined Instance Inference (Standard Top-K Strategy):
         1. 选取 Top-K (100) 个 Query。
@@ -398,7 +406,7 @@ class Trainer():
 
         # 4A. 输出 Instance List
         # 保留所有 Top-K 给 evaluator 去算 recall
-        keep = final_scores > 0
+        keep = final_scores > 0.05
         instance_list = {
             "masks": mask_pred_binary[keep].bool(), # [M, H, W]
             "scores": final_scores[keep], # [M]
