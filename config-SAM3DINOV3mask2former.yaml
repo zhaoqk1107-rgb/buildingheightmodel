@@ -1,0 +1,84 @@
+project_name:
+  'SAM3DINOV3MASK2FORMER'
+
+DATASETS:
+    datasets: ["Hongkong", "Chongqing", "Guangzhou", "Nanchang", "Nanjing", "Wuhan", "Xian"] #
+    num_sample: 2500
+    img_size: 512
+
+SAM:
+    cfg_path: "configs/sam2.1/sam2.1_hiera_b+.yaml"
+    checkpoint_path: "model/checkpoints/sam3.pt"
+    word_path : "model/SAM3UNet/sam3/assets/bpe_simple_vocab_16e6.txt.gz"
+    lora_rank: 64
+
+DINO:
+    checkpoint_path: "model/checkpoints/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
+
+TRAIN:
+    log_dir: "experiments/SAM2DINOV3MASK2FORMER"
+    val_split: 0.1
+    eval_interval: 1
+    batch_size: 2
+    epochs: 30
+    device: "cuda:0"
+    ngpus: 1
+    max_height: 200.0
+    min_height: 0.0
+    n_bins: 256
+MODEL:
+    SEM_SEG_HEAD:
+        LOSS_WEIGHT: 1.0
+        CONVS_DIM: 256
+        MASK_DIM: 256
+        NORM: "GN"
+        COMMON_STRIDE: 4
+        NUM_CLASSES: 1
+        DEFORMABLE_TRANSFORMER_ENCODER_IN_FEATURES: ["res3", "res4", "res5"]
+        TRANSFORMER_ENC_LAYERS: 6
+        TRANSFORMER_DIM_FEEDFORWARD: 2048
+
+    MASK_FORMER:
+            DEEP_SUPERVISION: True
+            NO_OBJECT_WEIGHT: 0.1
+
+            # loss
+            CLASS_WEIGHT: 2.0 # class
+            MASK_WEIGHT: 5.0 # mask
+            DICE_WEIGHT: 10.0 # mask
+            HEIGHT_WEIGHT: 0.5
+
+            # transformer config
+            HIDDEN_DIM: 256
+            NUM_OBJECT_QUERIES: 160 # 必须整除NHEADS
+            NHEADS: 8
+            DROPOUT: 0.1
+            DIM_FEEDFORWARD: 2048
+            ENC_LAYERS: 0
+            PRE_NORM: True
+            ENFORCE_INPUT_PROJ: False
+            SIZE_DIVISIBILITY: 32
+            DEC_LAYERS: 10  # 9 decoder layers, add one for the loss on learnable query
+            TRAIN_NUM_POINTS: 24576
+            OVERSAMPLE_RATIO: 6
+            IMPORTANCE_SAMPLE_RATIO: 0.75
+
+
+SOLVER:
+      IMS_PER_BATCH: 16
+      BASE_LR: 0.0001
+      MAX_ITER: 16000
+      WARMUP_FACTOR: 1.0
+      WARMUP_ITERS: 0
+      WEIGHT_DECAY: 0.05
+      OPTIMIZER: "ADAMW"
+      LR_SCHEDULER_NAME: "WarmupPolyLR"
+      BACKBONE_MULTIPLIER: 0.1
+      CLIP_GRADIENTS:
+        ENABLED: True
+        CLIP_TYPE: "full_model"
+        CLIP_VALUE: 0.1
+        NORM_TYPE: 2.0
+      AMP:
+          ENABLED: True
+
