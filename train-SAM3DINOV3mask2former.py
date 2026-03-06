@@ -137,46 +137,40 @@ class Trainer():
             importance_sample_ratio=self.CONFIG.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
             device = self.device,
         )
-
         self.optimizer = self.build_optimizer()
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max = self.CONFIG.TRAIN.epochs, eta_min = 1e-7)
         self.train_loss_history = []
         self.val_loss_history = []
-
         self.scaler = GradScaler()
 
 
-    # def update_loss_weights(self, epoch):
-    #     """
-    #     动态调整损失权重策略 (Loss Warm-up)
-    #     """
-    #     warmup_epochs = 5
-    #     target_h_weight = self.CONFIG.MODEL.MASK_FORMER.HEIGHT_WEIGHT
-    #     if epoch <= warmup_epochs:
-    #         current_h_weight = target_h_weight * (epoch / warmup_epochs) + 1
-    #     else:
-    #         current_h_weight = target_h_weight
-    #     # 更新主 Loss
-    #     self.loss_weight_dict["loss_height_l1"] = current_h_weight
-    #     self.loss_weight_dict["loss_height_l2"] = current_h_weight
-    #     # 更新辅助 Loss (Deep Supervision)
-    #     if self.CONFIG.MODEL.MASK_FORMER.DEEP_SUPERVISION:
-    #         for i in range(self.CONFIG.MODEL.MASK_FORMER.DEC_LAYERS):
-    #             self.loss_weight_dict[f"loss_height_l1_{i}"] = current_h_weight
-    #             self.loss_weight_dict[f"loss_height_l2_{i}"] = current_h_weight
-    #
-    #     return current_h_weight
+    def update_loss_weights(self, epoch):
+        if epoch > 30:
+            self.loss_weight_dict = {
+                "loss_ce": 5.0,
+                "loss_mask": 300.0,
+                "loss_dice": 1.0,
+                "loss_height_l1": 5.0,
+                "loss_height_l2": 5.0,
+            }
+            if self.CONFIG.MODEL.MASK_FORMER.DEEP_SUPERVISION:
+                aux_weight_dict = {}
+                for i in range(CONFIG.MODEL.MASK_FORMER.DEC_LAYERS):
+                    aux_weight_dict.update({k + f"_{i}": v for k, v in self.loss_weight_dict.items()})
+                self.loss_weight_dict.update(aux_weight_dict)
+        else:
+            return
+
 
     def train_epoch(self, epoch):
         self.model.train()
         self.criterion.train()
         total_loss_avg = 0
-        # self.update_loss_weights(epoch)
+        self.update_loss_weights(epoch)
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch + 1}/{self.CONFIG.TRAIN.epochs}")
         for i, (images, targets) in enumerate(pbar): # collate_fn 返回 (images, targets)
             self.optimizer.zero_grad()
             images = images.to(self.device)
-            # targets 已经是 list of dicts，不需要 prepare_targets 了
             targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
             with autocast(dtype=torch.bfloat16):
                 outputs = self.model(images)
@@ -189,9 +183,7 @@ class Trainer():
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.CONFIG.SOLVER.CLIP_GRADIENTS.CLIP_VALUE)
             self.scaler.step(self.optimizer)
             self.scaler.update()
-            # total_loss.backward()
             total_loss_avg += total_loss.item()
-            # self.optimizer.step()
 
             # 获取最后一层（主输出）的 loss * 权重
             w_ce = losses.get('loss_ce', torch.tensor(0.0)).item() * self.loss_weight_dict["loss_ce"]
@@ -199,7 +191,6 @@ class Trainer():
             w_mask = losses.get('loss_mask', torch.tensor(0.0)).item() * self.loss_weight_dict["loss_mask"]
             w_l1 = losses.get('loss_height_l1', torch.tensor(0.0)).item() * self.loss_weight_dict["loss_height_l1"]
             w_l2 = losses.get('loss_height_l2', torch.tensor(0.0)).item() * self.loss_weight_dict["loss_height_l2"]
-
 
 
 
@@ -375,8 +366,9 @@ class Trainer():
 
         return metrics, avg_val_loss
 
+
     @torch.no_grad()
-    def instance_inference(self, logits, mask_pred, height_pred, target_size, threshold=0.05):
+    def instance_inference(self, logits, mask_pred, height_pred, target_size):
         """
         Refined Instance Inference (Standard Top-K Strategy):
         1. 选取 Top-K (100) 个 Query。
@@ -386,84 +378,78 @@ class Trainer():
         彻底解决 "Argmax Artifacts" (甜甜圈/同心圆) 问题。
         """
 
-        # 1. 上采样 & 基础数据准备
         mask_pred = F.interpolate(
             mask_pred.unsqueeze(0),
             size=target_size,
             mode="bilinear",
             align_corners=False
-        ).squeeze(0)
+        ).squeeze(0) # [nq, 512, 512]
 
-        # 2. 计算分数 (Class Score * Mask Quality)
-        # 不管分数多低，先取前 100 名。依靠 mAP 评估去惩罚低分误检。
-        class_prob = logits.softmax(-1)[..., 0]
+
+        class_prob = logits.softmax(-1)[:, :-1] # [nq, 1]
         num_queries = class_prob.shape[0]
         topk_num = min(100, num_queries)
-        scores_per_image, topk_indices = class_prob.topk(topk_num, sorted=False)
-        # 根据 Top-K 提取数据
-        mask_pred = mask_pred[topk_indices]
-        height_pred = height_pred[topk_indices]
-        if height_pred.dim() > 1: height_pred = height_pred.squeeze(1)
+        scores_per_image, topk_indices = class_prob[:, 0].topk(topk_num, sorted=False) # [100, ]
 
-        # 3. 计算 Mask Quality Score (Official Strategy)
+        mask_pred = mask_pred[topk_indices] # [100, 512, 512]
+        height_pred = height_pred[topk_indices] # [100, ]
+
         mask_pred_sigmoid = mask_pred.sigmoid()
-        mask_pred_binary = (mask_pred > 0).float() # 官方阈值 0.0 (logits)
-        # 最终分数 = 分类概率 * Mask质量(二值化Mask内的平均置信度)
+        mask_pred_binary = (mask_pred > 0).float() # 作为非0掩膜
         mask_scores_per_image = (mask_pred_sigmoid.flatten(1) * mask_pred_binary.flatten(1)).sum(1) / (mask_pred_binary.flatten(1).sum(1) + 1e-6)
-        final_scores = scores_per_image * mask_scores_per_image
+        # 最终分数 = 分类概率 * Mask概率
+        final_scores = scores_per_image * mask_scores_per_image # [100, ]
 
-        # 4A. 输出 Instance List
-        # 保留所有 Top-K 给 evaluator 去算 recall
-        keep = final_scores > 0.05
+        # ==========================================================
+        # 🟢 第一部分：输出给 Evaluator 算 mAP 用的数据 (实例级)
+        # ==========================================================
         instance_list = {
-            "masks": mask_pred_binary[keep].bool(), # [M, H, W]
-            "scores": final_scores[keep], # [M]
-            "labels": torch.zeros_like(final_scores[keep], dtype=torch.long),
-            "heights": height_pred[keep]
+            "masks": mask_pred_binary.bool(),  # [100, 512, 512] 允许重叠
+            "scores": final_scores,  # [100]
+            "labels": torch.zeros_like(final_scores, dtype=torch.long),
+            "heights": height_pred
         }
 
-        # 4B. 输出 Instance Map (用于可视化 & 生成最终产品, 解决"同心圆"问题)
-        h, w = target_size
-        final_instance_map = torch.zeros((h, w), dtype=torch.int32, device=self.device)
-        final_height_map = torch.zeros((h, w), dtype=torch.float32, device=self.device)
+        # ==========================================================
+        # 🔵 第二部分：出图 / 最终产品的非重叠 2D 图 (Panoptic/Map)
+        # ==========================================================
+        final_instance_map = torch.zeros(target_size, dtype=torch.int32, device=self.device)
+        final_height_map = torch.zeros(target_size, dtype=torch.float32, device=self.device)
         if final_scores.shape[0] == 0:
             return instance_list, final_instance_map, final_height_map
 
-        # # --- 像素竞争逻辑 (Vectorized) ---只有通过了 threshold 的 Query 才有资格参加像素竞争
-        candidate_mask = final_scores > threshold
-        comp_scores = final_scores[candidate_mask] # [K]
-        comp_masks_probs = mask_pred_sigmoid[candidate_mask] # [K, H, W]
-        comp_heights = height_pred[candidate_mask]  # [K]
-        # 构造概率张量 [M, H, W]
-        prob_map = comp_scores.view(-1, 1, 1) * comp_masks_probs
-        # 构造背景层参与竞争：如果某像素上所有 Mask 的分数都低于 threshold，则该像素判为背景
-        bg_prob = torch.full((1, h, w), threshold, device=self.device)
-        # 拼接: [Background, Instance_1, Instance_2, ...] # 0是背景, 1是第一个candidate. # 维度变为 [K+1, H, W]
-        all_probs = torch.cat([bg_prob, prob_map], dim=0)
-        # Argmax: 0 是背景，1~K 是实例
-        winner_indices = all_probs.argmax(dim=0)
+        candidate_mask = final_scores > self.CONFIG.MODEL.MASK_FORMER.TEST.OBJECT_MASK_THRESHOLD # 筛选高置信度物体
+        # 如果连一个达到 0.8 分的都没有，说明整张图全是背景，直接返回空图
+        if not candidate_mask.any():
+            return instance_list, final_instance_map, final_height_map
+        comp_scores = final_scores[candidate_mask] # [n] 选出了n个置信度大于0.8的
+        comp_masks_probs = mask_pred_sigmoid[candidate_mask] # [n, H, W]
+        comp_heights = height_pred[candidate_mask]  # [n]
+
+        cur_prob_masks = comp_scores.view(-1, 1, 1) * comp_masks_probs
+        cur_mask_ids = cur_prob_masks.argmax(0)  # [H, W], 值是 0 到 K-1
+
 
         # 面积比率过滤 (Panoptic Logic from bdhnet)
-        # 目的：如果一个 Mask 在竞争中丢失了大部分面积（变成了甜甜圈的外圈），则将其剔除
-        # 我们遍历所有 Top-K 实例
         num_candidates = comp_scores.shape[0]
-        for k in range(1, num_candidates + 1):
-            # 竞争胜出面积 (Won Area)
-            won_mask = (winner_indices == k) & (comp_masks_probs[k - 1] >= 0.5)
-            won_area = won_mask.sum().item()
-            # 过滤逻辑：
-            # 1. 必须赢得了至少 1 个像素
-            # 2. 必须原本就有像素
-            # 3. 赢得的比例必须足够高 (防止甜甜圈外圈)
-            # overlap_threshold，, 意味着如果一个 mask 赢下的面积不到它原始面积的 60%，它就会被丢弃
-            original_area = (comp_masks_probs[k - 1] >= 0.5).sum().item() # 原始预测面积 (Original Area),对应 mask_pred_binary[k-1]
-            overlap_threshold = 0.8
-            if won_area > 0 and original_area > 0:
-                if won_area < overlap_threshold * original_area:
-                    continue  # 剔除！这个 Mask 只是个“外圈”，丢弃它，这部分像素变回背景
-                final_instance_map[won_mask] = k  # 这里 k 是 1~K 的唯一ID
-                final_height_map[won_mask] = comp_heights[k - 1]
+        for k in range(num_candidates):
+            # 这里的 0.5 是 Sigmoid 掩膜的绝对二值化阈值，这就是真正的背景判定逻辑！
+            mask = (cur_mask_ids == k) & (comp_masks_probs[k] >= 0.5)
+
+            mask_area = mask.sum().item()
+            original_area = (comp_masks_probs[k] >= 0.5).sum().item()
+
+            if mask_area > 0 and original_area > 0:
+                # 如果竞争后剩下的面积不到原本面积的 80%，说明这是个被切割严重的碎片/外圈，丢弃！
+                if (mask_area / original_area) < self.CONFIG.MODEL.MASK_FORMER.TEST.OVERLAP_THRESHOLD: # 0.8
+                    continue
+
+                    # 写入最终的 Map，ID 从 1 开始 (0 留给背景)
+                final_instance_map[mask] = k + 1
+                final_height_map[mask] = comp_heights[k]
+
         return instance_list, final_instance_map, final_height_map
+
 
     def validate_and_visualize(self, epoch):
         try:
@@ -493,7 +479,6 @@ class Trainer():
             gt_h_vis = targets[0]['height_map'].squeeze().cpu().numpy()
             pred_h_vis = height_map.cpu().numpy()
 
-            # --- 新增：准备 GT 实例 (Reference Instances) 可视化数据 ---
             # targets[0]['masks'] 的形状是 [N, H, W]
             gt_masks = targets[0]['masks'].cpu()
             h, w = gt_masks.shape[-2:]
