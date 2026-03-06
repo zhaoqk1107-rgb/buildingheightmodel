@@ -3,7 +3,7 @@ project_name:
 
 DATASETS:
     datasets: ["Hongkong", "Chongqing", "Guangzhou", "Nanchang", "Nanjing", "Wuhan", "Xian"] #
-    num_sample: -1
+    num_sample: 5000
     img_size: 512
 
 SAM:
@@ -20,7 +20,7 @@ TRAIN:
     val_split: 0.1
     eval_interval: 1
     batch_size: 2
-    epochs: 30
+    epochs: 60
     device: "cuda:0"
     ngpus: 1
     max_height: 200.0
@@ -32,9 +32,9 @@ MODEL:
         CONVS_DIM: 256
         MASK_DIM: 256
         NORM: "GN"
-        COMMON_STRIDE: 2
+        COMMON_STRIDE: 4
         NUM_CLASSES: 1
-        DEFORMABLE_TRANSFORMER_ENCODER_IN_FEATURES: ["res2", "res3", "res4"]
+        DEFORMABLE_TRANSFORMER_ENCODER_IN_FEATURES: ["res3", "res4", "res5"]
         TRANSFORMER_ENC_LAYERS: 6
         TRANSFORMER_DIM_FEEDFORWARD: 2048
 
@@ -44,8 +44,8 @@ MODEL:
 
             # loss
             CLASS_WEIGHT: 2.0 # class
-            MASK_WEIGHT: 5.0 # mask
-            DICE_WEIGHT: 10.0 # mask
+            MASK_WEIGHT: 300.0 # mask
+            DICE_WEIGHT: 5.0 # mask
             HEIGHT_WEIGHT: 1.0
 
             # transformer config
@@ -59,10 +59,12 @@ MODEL:
             ENFORCE_INPUT_PROJ: False
             SIZE_DIVISIBILITY: 32
             DEC_LAYERS: 10  # 9 decoder layers, add one for the loss on learnable query
-            TRAIN_NUM_POINTS: 24576
-            OVERSAMPLE_RATIO: 6
+            TRAIN_NUM_POINTS: 12544
+            OVERSAMPLE_RATIO: 3
             IMPORTANCE_SAMPLE_RATIO: 0.75
-
+            TEST:
+              OBJECT_MASK_THRESHOLD: 0.25
+              OVERLAP_THRESHOLD: 0.75
 
 SOLVER:
       IMS_PER_BATCH: 16

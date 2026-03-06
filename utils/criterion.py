@@ -102,25 +102,23 @@ def sigmoid_ce_loss(inputs, targets, num_masks):
         Loss tensor
     """
     loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-    # 修复：使用 num_masks 进行归一化
     return loss.mean(1).sum() / num_masks
 
 
-# # 将这个工具函数加到 criterion.py 顶部
-# def sigmoid_focal_loss(inputs, targets, num_masks, alpha: float = 0.25, gamma: float = 2):
-#     """
-#     原版 Mask2Former 必备的分类 Focal Loss
-#     """
-#     prob = inputs.sigmoid()
-#     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-#     p_t = prob * targets + (1 - prob) * (1 - targets)
-#     loss = ce_loss * ((1 - p_t) ** gamma)
-#
-#     if alpha >= 0:
-#         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-#         loss = alpha_t * loss
-#
-#     return loss.mean(1).sum() / num_masks
+def sigmoid_focal_loss(inputs, targets, num_masks, alpha: float = 0.25, gamma: float = 2):
+    """
+    原版 Mask2Former 必备的分类 Focal Loss
+    """
+    prob = inputs.sigmoid()
+    ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    p_t = prob * targets + (1 - prob) * (1 - targets)
+    loss = ce_loss * ((1 - p_t) ** gamma)
+
+    if alpha >= 0:
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = alpha_t * loss
+
+    return loss.mean(1).sum() / num_masks
 
 
 
@@ -151,59 +149,10 @@ class SetCriterion(nn.Module):
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
         return {"loss_ce": loss_ce}
 
-    # def loss_masks(self, outputs, targets, indices, num_masks):
-    #     """
-    #     [关键修改] Mask Loss 计算：不再使用全图插值，而是使用 PointRend 采样策略。
-    #     这样可以让模型专注于优化“边缘”等难点，从而让输出更锐利（直角化）。
-    #     """
-    #     assert "pred_masks" in outputs
-    #
-    #     # 1. 提取匹配好的 Pred Mask
-    #     src_idx = self._get_src_permutation_idx(indices)
-    #     tgt_idx = self._get_tgt_permutation_idx(indices)
-    #
-    #     src_masks = outputs["pred_masks"][src_idx]  # [N_matched, H_pred, W_pred]
-    #     src_masks = src_masks.unsqueeze(1)  # [N_matched, 1, H_pred, W_pred]
-    #
-    #     # 2. 提取匹配好的 GT Mask
-    #     target_masks = [t["masks"] for t in targets]
-    #     target_masks, _ = nested_tensor_from_tensor_list(target_masks).decompose()
-    #     target_masks = target_masks.to(src_masks)[tgt_idx]  # [N_matched, H_gt, W_gt]
-    #     target_masks = target_masks.unsqueeze(1)  # [N_matched, 1, H_gt, W_gt]
-    #
-    #     # 3. [PointRend]
-    #     with torch.no_grad():
-    #         point_coords = get_uncertain_point_coords_with_randomness(
-    #             src_masks.detach(),
-    #             self.num_points,  # 12544
-    #             self.oversample_ratio,  # 3.0
-    #             self.importance_sample_ratio  # 0.75
-    #         )
-    #
-    #         point_labels = point_sample(
-    #             target_masks,
-    #             point_coords,
-    #             align_corners=False,
-    #         ).squeeze(1)
-    #
-    #     point_logits = point_sample(
-    #         src_masks,
-    #         point_coords,
-    #         align_corners=False,
-    #     ).squeeze(1)
-    #
-    #     # 6. 计算 Point-wise Loss
-    #     losses = {
-    #         "loss_mask": sigmoid_ce_loss(point_logits, point_labels, num_masks),
-    #         "loss_dice": dice_loss(point_logits, point_labels, num_masks),
-    #     }
-    #     del point_logits, target_masks, src_masks
-    #     return losses
-
     def loss_masks(self, outputs, targets, indices, num_masks):
         """
-        [修改说明] 移除 PointRend 采样，使用 Dense (密集) 方式计算 Mask Loss。
-        保证遥感图像中每一个微小的建筑物像素都能参与梯度回传。
+        [关键修改] Mask Loss 计算：不再使用全图插值，而是使用 PointRend 采样策略。
+        这样可以让模型专注于优化“边缘”等难点，从而让输出更锐利（直角化）。
         """
         assert "pred_masks" in outputs
 
@@ -211,36 +160,85 @@ class SetCriterion(nn.Module):
         src_idx = self._get_src_permutation_idx(indices)
         tgt_idx = self._get_tgt_permutation_idx(indices)
 
-        # [N_matched, H_pred, W_pred]
-        src_masks = outputs["pred_masks"][src_idx]
+        src_masks = outputs["pred_masks"][src_idx]  # [N_matched, H_pred, W_pred]
+        src_masks = src_masks.unsqueeze(1)  # [N_matched, 1, H_pred, W_pred]
 
         # 2. 提取匹配好的 GT Mask
         target_masks = [t["masks"] for t in targets]
         target_masks, _ = nested_tensor_from_tensor_list(target_masks).decompose()
-        # [N_matched, H_gt, W_gt]
-        target_masks = target_masks.to(src_masks)[tgt_idx]
+        target_masks = target_masks.to(src_masks)[tgt_idx]  # [N_matched, H_gt, W_gt]
+        target_masks = target_masks.unsqueeze(1)  # [N_matched, 1, H_gt, W_gt]
 
-        # 3. 尺寸对齐：将高分辨率的 GT Mask 降采样到 Pred Mask 的尺寸 (通常是 1/4)
-        # 降采样 GT 比上采样 Pred 更节省显存，且不影响小目标检测
-        target_masks = F.interpolate(
-            target_masks.unsqueeze(1).float(),
-            size=src_masks.shape[-2:],
-            mode="nearest"
+        # 3. [PointRend]
+        with torch.no_grad():
+            point_coords = get_uncertain_point_coords_with_randomness(
+                src_masks.detach(),
+                self.num_points,  # 12544
+                self.oversample_ratio,  # 3.0
+                self.importance_sample_ratio  # 0.75
+            )
+
+            point_labels = point_sample(
+                target_masks,
+                point_coords,
+                align_corners=False,
+            ).squeeze(1)
+
+        point_logits = point_sample(
+            src_masks,
+            point_coords,
+            align_corners=False,
         ).squeeze(1)
 
-        # 4. 展平张量准备计算 Loss
-        # [N_matched, H_pred * W_pred]
-        src_masks = src_masks.flatten(1)
-        target_masks = target_masks.flatten(1)
-
-        # 5. 计算 Dense Point-wise Loss
+        # 6. 计算 Point-wise Loss
         losses = {
-            "loss_mask": sigmoid_ce_loss(src_masks, target_masks, num_masks),
-            "loss_dice": dice_loss(src_masks, target_masks, num_masks),
+            "loss_mask": sigmoid_ce_loss(point_logits, point_labels, num_masks),
+            "loss_dice": dice_loss(point_logits, point_labels, num_masks),
         }
-
-        del target_masks, src_masks
+        del point_logits, target_masks, src_masks
         return losses
+
+    # def loss_masks(self, outputs, targets, indices, num_masks):
+    #     """
+    #     [修改说明] 移除 PointRend 采样，使用 Dense (密集) 方式计算 Mask Loss。
+    #     保证遥感图像中每一个微小的建筑物像素都能参与梯度回传。
+    #     """
+    #     assert "pred_masks" in outputs
+    #
+    #     # 1. 提取匹配好的 Pred Mask
+    #     src_idx = self._get_src_permutation_idx(indices)
+    #     tgt_idx = self._get_tgt_permutation_idx(indices)
+    #
+    #     # [N_matched, H_pred, W_pred]
+    #     src_masks = outputs["pred_masks"][src_idx]
+    #
+    #     # 2. 提取匹配好的 GT Mask
+    #     target_masks = [t["masks"] for t in targets]
+    #     target_masks, _ = nested_tensor_from_tensor_list(target_masks).decompose()
+    #     # [N_matched, H_gt, W_gt]
+    #     target_masks = target_masks.to(src_masks)[tgt_idx]
+    #
+    #     # 3. 尺寸对齐：将高分辨率的 GT Mask 降采样到 Pred Mask 的尺寸 (通常是 1/4)
+    #     # 降采样 GT 比上采样 Pred 更节省显存，且不影响小目标检测
+    #     target_masks = F.interpolate(
+    #         target_masks.unsqueeze(1).float(),
+    #         size=src_masks.shape[-2:],
+    #         mode="bilinear"
+    #     ).squeeze(1)
+    #
+    #     # 4. 展平张量准备计算 Loss
+    #     # [N_matched, H_pred * W_pred]
+    #     src_masks = src_masks.flatten(1)
+    #     target_masks = target_masks.flatten(1)
+    #
+    #     # 5. 计算 Dense Point-wise Loss
+    #     losses = {
+    #         "loss_mask": sigmoid_ce_loss(src_masks, target_masks, num_masks),
+    #         "loss_dice": dice_loss(src_masks, target_masks, num_masks),
+    #     }
+    #
+    #     del target_masks, src_masks
+    #     return losses
 
     def loss_height(self, outputs, targets, indices, num_masks):
         assert "pred_heights" in outputs

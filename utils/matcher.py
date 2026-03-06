@@ -82,40 +82,48 @@ class HungarianMatcher(nn.Module):
         assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
         self.num_points = num_points
 
-
     @torch.no_grad()
     def memory_efficient_forward(self, outputs, targets):
         bs, num_queries = outputs["pred_logits"].shape[:2]
         indices = []
 
         for b in range(bs):
+            # 1. Class Cost 保持不变 (Softmax)
             out_prob = outputs["pred_logits"][b].softmax(-1)
             tgt_ids = targets[b]["labels"]
             cost_class = -out_prob[:, tgt_ids]
 
-            # 2. Mask Cost (移除 point_sample, 改用 1/4 尺度的 Dense Matching)
-            out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred] 通常是 1/4 尺寸
-            tgt_mask = targets[b]["masks"].to(out_mask)  # [num_gt, H_gt, W_gt] 原尺寸
+            # 2. 🚨 修复：改回 PointRend 点匹配 🚨
+            out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
+            tgt_mask = targets[b]["masks"].to(out_mask)  # [num_gt, H_gt, W_gt] 原尺寸高清 Mask
 
-            # 将 GT Mask 插值到预测 Mask 的尺寸 (例如 128x128)，保证所有小建筑都能参与匹配
-            tgt_mask = F.interpolate(
+            # 核心：生成均匀的纯随机点进行匹配（匹配阶段无需计算 uncertainty，纯随机最快）
+            # 提取 12544 个随机点坐标
+            point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
+
+            # [num_gt, num_points] 从高清 GT 提取 12544 个像素的值
+            tgt_mask = point_sample(
                 tgt_mask.unsqueeze(1).float(),
-                size=out_mask.shape[-2:],
-                mode="nearest"
+                point_coords.repeat(tgt_mask.shape[0], 1, 1),
+                align_corners=False
             ).squeeze(1)
 
-            out_mask = out_mask.flatten(1)  # [num_queries, H_pred * W_pred]
-            tgt_mask = tgt_mask.flatten(1)  # [num_gt, H_pred * W_pred]
+            # [num_queries, num_points] 从预测特征图提取这 12544 个位置的值
+            out_mask = point_sample(
+                out_mask.unsqueeze(1),
+                point_coords.repeat(out_mask.shape[0], 1, 1),
+                align_corners=False
+            ).squeeze(1)
 
             with autocast(enabled=False):
                 out_mask = out_mask.float()
                 tgt_mask = tgt_mask.float()
 
-                # 计算密集特征图上的 Cost
+                # 在这 12544 个点上计算代价，避免了任何降采样带来的边缘膨胀
                 cost_mask = batch_sigmoid_ce_loss(out_mask, tgt_mask)
                 cost_dice = batch_dice_loss(out_mask, tgt_mask)
 
-            # 移除 cost_center!
+            # 合并 Cost 进行匈牙利匹配
             C = (self.cost_mask * cost_mask + self.cost_class * cost_class + self.cost_dice * cost_dice)
             C = C.reshape(num_queries, -1).cpu()
 
